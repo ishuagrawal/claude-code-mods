@@ -8,6 +8,7 @@ import {
   WARN_AT,
   activeMs,
   describe,
+  formatUsed,
   duration,
   gaugeOf,
   loopShare,
@@ -30,6 +31,8 @@ import {
   withLoopDone,
   withPaused,
   withReading,
+  withResumed,
+  raisedLimit,
   withStep,
   historyEntryOf,
   withHistory,
@@ -52,6 +55,7 @@ const CALIBRATION_KEY = 'calibration'
 const editingAtom = atom({ plugin: 'budget-fence', key: 'editing' } as const, null, { shape: 'editing-1' })
 const recentOpenAtom = atom({ plugin: 'budget-fence', key: 'recentOpen' } as const, false, { shape: 'recent-1' })
 const planAtom = atom({ plugin: 'budget-fence', key: 'plan' } as const, null, { shape: 'plan-1' })
+const heldAtom = atom({ plugin: 'budget-fence', key: 'held' } as const, null, { shape: 'held-1' })
 
 /** Saved limits, checked key by key and filled out with the defaults. */
 function savedLimits(value: unknown): FenceLimits | null {
@@ -81,10 +85,105 @@ async function calibration($: EngineInterface): Promise<FenceCalibration> {
 /** Keeps which windows the plan has, so the pane offers only those. */
 async function notePlan($: EngineInterface, readings: readonly Reading[]) {
   const plan = planOf(readings)
-  if (plan) await update($, planAtom, () => plan)
+  if (!plan) return
+  // Written only on a change: each write redraws the pane, which resets an open dropdown.
+  const was = await read($, planAtom)
+  if (was?.hasSession !== plan.hasSession || was?.hasWeekly !== plan.hasWeekly) await update($, planAtom, () => plan)
+}
+
+/**
+ * `update` for the run, writing nothing when `fn` hands back the run it was
+ * given: every write redraws the pane, which puts an open dropdown's highlight
+ * back on its value.
+ */
+async function changeRun($: EngineInterface, fn: (run: FenceRun | null) => FenceRun | null) {
+  const run = await read($, runAtom)
+  if (fn(run) === run) return
+  await update($, runAtom, fn)
+}
+
+/** Saves one setting, applying it to the prompt already running. */
+async function saveLimit($: EngineInterface, key: keyof FenceLimits, value: FenceLimits[keyof FenceLimits]) {
+  const next = await update($, limitsAtom, l => ({ ...l, [key]: value }))
+  await $.store.set(STORE_KEY, next)
+  await changeRun($, r => (r && r.status !== 'done' ? withLimitChanged(r, key) : r))
+}
+
+/** Each limit as the question names it. */
+const LIMIT_NAMES: Record<Gauge, string> = {
+  minutes: 'time limit',
+  tokens: 'token limit',
+  share: 'session share',
+  weeklyShare: 'weekly share',
+}
+const STOP = 'Stop here'
+const OPEN = 'Open Budget fence'
+const KEEP = 'Continue with the limits as set'
+
+/**
+ * Asks, where the prompt box is, whether to go on past a tripped limit:
+ * continue and raise that setting, stop, or open the pane to change any of
+ * them. Text typed under Other is read as a new value for the tripped limit,
+ * and otherwise handed to Claude as the person's words.
+ */
+export async function askToContinue($: EngineInterface, trip: Trip): Promise<{ go: true } | { go: false; said?: string }> {
+  let hasOpened = false
+  let note = ''
+  for (;;) {
+    const [run, limits, now] = await Promise.all([read($, runAtom), read($, limitsAtom), $.clock.now()])
+    if (!run) return { go: true }
+    const g = gaugeOf(run, limits, trip.kind, now)
+    const used = g?.used ?? 0
+    const raised = raisedLimit(trip.kind, limits[trip.kind], used)
+    const raise = `Continue and raise the ${LIMIT_NAMES[trip.kind]} to ${limitLabel(trip.kind, raised)}`
+    const question = `${note}This prompt has used ${formatUsed(trip.kind, used, g?.share)}, past its ${LIMIT_NAMES[trip.kind]} of ${limitLabel(trip.kind, g?.cap ?? limits[trip.kind])}. Keep working?`
+    note = ''
+    let answer: string
+    try {
+      answer = await $.ui.ask(question, {
+        header: 'Budget fence',
+        options: hasOpened ? [KEEP, raise, STOP] : [raise, STOP, OPEN],
+      })
+    } catch {
+      // Dismissed: nobody said go on.
+      return { go: false }
+    }
+    if (answer === STOP) return { go: false }
+    if (answer === raise) {
+      await saveLimit($, trip.kind, raised)
+      return { go: true }
+    }
+    if (answer === OPEN) {
+      void $.ui.open({ id: PANE, title: TITLE })
+      hasOpened = true
+      continue
+    }
+    if (answer !== KEEP) {
+      const typed = parseLimitInput(trip.kind, answer)
+      if (typed === null) return { go: false, said: answer }
+      if (typed !== 0 && typed <= used) {
+        note = `${limitLabel(trip.kind, typed)} is no more than it has used. `
+        continue
+      }
+      await saveLimit($, trip.kind, typed)
+      return { go: true }
+    }
+    // Kept as set: go on unless the pane left this prompt over a limit.
+    const [runNow, limitsNow, nowNow] = await Promise.all([read($, runAtom), read($, limitsAtom), $.clock.now()])
+    const still = runNow ? tripOf(runNow, limitsNow, nowNow) : null
+    if (!still) return { go: true }
+    hasOpened = false
+    note = 'Still over a limit. '
+    trip = still
+  }
 }
 
 export const register: Register = on => {
+  // The run the pane last drew, kept while a setting's dropdown holds the focus.
+  let paneRun: FenceRun | null = null
+  let paneNow = 0
+  // One question at a time: calls that trip while it is open share its answer.
+  let asking: ReturnType<typeof askToContinue> | null = null
   // Calls paused by the fence, by tool_use_id: what tripped, and in which loop.
   const pending = new Map<string, { trip: Trip; loopId: string }>()
   // Which limit holds the band's bar.
@@ -120,7 +219,7 @@ export const register: Register = on => {
     if ('error' in parsed) return { text: parsed.error }
     await update($, limitsAtom, () => parsed.limits)
     await $.store.set(STORE_KEY, parsed.limits)
-    await update($, runAtom, run => {
+    await changeRun($, run => {
       if (!run || run.status === 'done') return run
       const changed = (Object.keys(parsed.limits) as (keyof FenceLimits)[]).filter(k => parsed.limits[k] !== limits[k])
       return changed.reduce(withLimitChanged, run)
@@ -145,7 +244,7 @@ export const register: Register = on => {
     const fresh = newRun(e.turnId, now, usage.rateLimits, e.text.trim() || lastPrompt, ratesOf(await calibration($)))
     await notePlan($, usage.rateLimits)
     pending.clear()
-    await update($, runAtom, prev => {
+    await changeRun($, prev => {
       const carried = (prev?.loops ?? []).filter(l => l.id !== MAIN && l.isRunning).map(l => ({ ...l, units: 0 }))
       return { ...fresh, loops: [...fresh.loops, ...carried] }
     })
@@ -160,14 +259,14 @@ export const register: Register = on => {
     if (stale) {
       pending.delete(stale[0])
       const now = await $.clock.now()
-      await update($, runAtom, run => (run?.status === 'paused' ? withDenied(run, now) : run))
+      await changeRun($, run => (run?.status === 'paused' ? withDenied(run, now) : run))
     }
     const stepped = yield* next(e)
     // Readings arrive with each response; a plan with no cost ledger raises
     // session.measure only when a window moves a whole point, so read them here.
     const { rateLimits } = await $.session.usage()
     await notePlan($, rateLimits)
-    await update($, runAtom, run =>
+    await changeRun($, run =>
       run ? withReading(withStep(run, loopId, stepped.usage?.model ?? e.model, stepped.usage), rateLimits) : run,
     )
 
@@ -177,7 +276,15 @@ export const register: Register = on => {
   on('session.measure', async ($, e, next) => {
     const measured = await next(e)
     if (e.rateLimits.length > 0) {
-      await update($, runAtom, run => (run ? withReading(run, e.rateLimits) : run))
+      // A finished prompt keeps its last reading, and an unchanged one is not written:
+      // every write redraws the pane, which puts an open dropdown's highlight back.
+      const run = await read($, runAtom)
+      if (run && run.status !== 'done') {
+        const remeasured = withReading(run, e.rateLimits)
+        if (JSON.stringify([remeasured.five, remeasured.week]) !== JSON.stringify([run.five, run.week])) {
+          await changeRun($, r => (r && r.status !== 'done' ? withReading(r, e.rateLimits) : r))
+        }
+      }
       await notePlan($, e.rateLimits)
     }
 
@@ -188,7 +295,7 @@ export const register: Register = on => {
     const spawned = await next(e)
     const agentId = spawned.deny === undefined ? spawned.agentId : undefined
     if (agentId !== undefined) {
-      await update($, runAtom, run =>
+      await changeRun($, run =>
         run
           ? withLoop(run, {
               id: agentId,
@@ -211,7 +318,7 @@ export const register: Register = on => {
     const loopId = e.agentId ?? MAIN
     const now = await $.clock.now()
     let finished: FenceRun | null = null
-    await update($, runAtom, run => {
+    await changeRun($, run => {
       if (!run || run.status === 'done') return run
       const after = withLoopDone(run, loopId, now)
       finished = after.status === 'done' ? after : null
@@ -247,8 +354,26 @@ export const register: Register = on => {
       }
     }
     const toolUseId = e.tool_use_id
+    if (e.approver === 'person') {
+      // The question sits where the prompt box is; the call waits on it.
+      await changeRun($, r => (r && r.status !== 'paused' ? withPaused(r, trip, toolUseId, now) : r))
+      asking ??= askToContinue($, trip).finally(() => {
+        asking = null
+      })
+      const answer = await asking
+      const after = await $.clock.now()
+      await changeRun($, r => (r && r.status === 'paused' ? (answer.go ? withResumed(r, after) : withDenied(r, after)) : r))
+      if (answer.go) return verdict
+      return {
+        decision: 'deny',
+        reason: answer.said
+          ? `Budget fence: ${trip.reason}, and the person stopped it, saying: ${answer.said}`
+          : `Budget fence: ${trip.reason}, and the person chose to stop here. Wrap up and report what you have so far.`,
+      }
+    }
+    // A host answers asks with no question to show: it gets the plain approval, and Allow gives half again.
     pending.set(toolUseId, { trip, loopId: e.agentId ?? MAIN })
-    await update($, runAtom, r => (r ? withPaused(r, trip, toolUseId, now) : r))
+    await changeRun($, r => (r ? withPaused(r, trip, toolUseId, now) : r))
 
     return { decision: 'ask', reason: `Budget fence: ${trip.reason}. ${raiseNote(limits, trip)}` }
   }).catch(($, e, next) => next(e))
@@ -259,7 +384,7 @@ export const register: Register = on => {
     if (paused) {
       pending.delete(e.tool_use_id)
       const [limits, now] = await Promise.all([read($, limitsAtom), $.clock.now()])
-      await update($, runAtom, run => {
+      await changeRun($, run => {
         if (!run) return run
         return ran.deny !== undefined ? withDenied(run, now) : withAllowed(run, limits, paused.trip, now)
       })
@@ -295,7 +420,16 @@ export const register: Register = on => {
 
     const isPaused = run.status === 'paused'
     const isStopped = run.status === 'denied'
-    const leadLevel: Level = isPaused || isStopped ? 'error' : levelOf(lead.g.used, lead.g.cap)
+    const isHalted = isPaused || isStopped
+    // Halted, the whole row takes the state's color, as the pane does: amber waiting, red stopped.
+    const leadLevel: Level = isPaused ? 'warning' : isStopped ? 'error' : levelOf(lead.g.used, lead.g.cap)
+
+    // One spacing scale for every state: an icon sits tight to what it labels,
+    // the bar a step from its figure, and groups well apart.
+    const tight: Space = isTerminal ? 1 : 'xs'
+    const item: Space = isTerminal ? 1 : 'sm'
+    const group: Space = isTerminal ? 2 : 'md'
+    const between: Space = isTerminal ? 3 : 'lg'
 
     const bar = (ratio: number) => {
       const r = Math.min(1, Math.max(0, ratio))
@@ -321,64 +455,54 @@ export const register: Register = on => {
       )
     }
 
-    // Calm: "7m / 20m". Near the cap: "3m left". Paused: what it reached.
-    const figure =
-      isPaused || isStopped ? (
-        <Text key="fig" size="footnote" tabular color="error">
-          {lead.g.share ? shareText(lead.g.share) : shortAmount(lead.gauge, lead.g.used)}
-        </Text>
-      ) : leadLevel === 'warning' ? (
-        <Text key="fig" size="footnote" tabular color="warning">
-          {shortAmount(lead.gauge, Math.max(0, lead.g.cap - lead.g.used))} left
-        </Text>
-      ) : (
-        <Text key="fig" size="footnote" tabular>
-          {lead.g.share ? shareText(lead.g.share) : shortAmount(lead.gauge, lead.g.used)}
-          <Text dimColor>{` / ${shortAmount(lead.gauge, lead.g.cap)}`}</Text>
-        </Text>
-      )
+    // Every state reads the same way, "used / limit", with the used part in the row's color.
+    const figure = (
+      <Text key="fig" size="footnote" tabular>
+        <Text color={leadLevel}>{lead.g.share ? shareText(lead.g.share) : shortAmount(lead.gauge, lead.g.used)}</Text>
+        <Text dimColor>{` / ${shortAmount(lead.gauge, lead.g.cap)}`}</Text>
+      </Text>
+    )
 
-    // Icon and number sit tight; limits sit well apart, so each number reads with its own icon.
-    const pair = (key: string, children: RenderChildren, gap: Space = isTerminal ? 0 : 'xs') => (
+    const pair = (key: string, children: RenderChildren, gap: Space = tight) => (
       <Box key={key} flexDirection="row" alignItems="center" columnGap={gap}>
         {children}
       </Box>
     )
-    const divider = Svg ? (
-      <Svg
-        key="divider"
-        alt=""
-        width={1}
-        height={14}
-        source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 14"><rect width="1" height="14" fill="${TRACK}"/></svg>`}
-      />
-    ) : (
-      <Text key="divider" dimColor>
-        │
-      </Text>
-    )
-    const status =
-      isPaused || isStopped
-        ? pair(
-            'status',
-            <Text size="footnote" weight="medium" color="error">
-              {isPaused ? '❚❚ Paused' : 'Stopped'}
-            </Text>,
-          )
-        : null
+    const divider = (key: string) =>
+      Svg ? (
+        <Svg
+          key={key}
+          alt=""
+          width={1}
+          height={DIVIDER_HEIGHT}
+          source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 ${DIVIDER_HEIGHT}"><rect width="1" height="${DIVIDER_HEIGHT}" fill="${DIVIDER}"/></svg>`}
+        />
+      ) : (
+        <Text key={key} dimColor>
+          │
+        </Text>
+      )
+    // Halted, a status leads the row: its own icon, like every limit, and its word.
+    const status = isHalted
+      ? pair('status', [
+          icon(isPaused ? 'pause' : 'stop', isPaused ? 'Paused' : 'Stopped'),
+          <Text key="word" size="footnote" weight="medium" color={leadLevel}>
+            {isPaused ? 'Paused' : 'Stopped'}
+          </Text>,
+        ])
+      : null
 
     // What fits: the lead always; the others while there is room.
     const columns = e.props.bodyColumns ?? 80
-    const room = Math.max(0, Math.floor((columns - 30) / (isTerminal ? 8 : 9)))
-    const others = isPaused || isStopped ? [] : rest.slice(0, room)
-    const between: Space = isTerminal ? 3 : 'lg'
+    const room = Math.max(0, Math.floor((columns - 30) / 9))
+    const others = isHalted ? [] : rest.slice(0, room)
 
     return (
-      <Box flexDirection="row" alignItems="center" columnGap={isTerminal ? 2 : 'md'}>
+      <Box flexDirection="row" alignItems="center" columnGap={group}>
         {status}
-        {status ? divider : null}
-        {pair('lead', [icon(BAND_ICONS[lead.gauge], GAUGE_NAMES[lead.gauge]), bar(lead.ratio), figure], isTerminal ? 1 : 'sm')}
-        {others.length > 0 ? divider : null}
+        {status ? divider('status-divider') : null}
+        {pair('lead', [icon(BAND_ICONS[lead.gauge], GAUGE_NAMES[lead.gauge]), pair('meter', [bar(lead.ratio), figure], item)])}
+        {others.length > 0 ? divider('others-divider') : null}
         {others.length > 0 ? (
           <Box key="others" flexDirection="row" alignItems="center" columnGap={between}>
             {others.map(o => {
@@ -401,27 +525,37 @@ export const register: Register = on => {
     )
   })
 
+  // Which setting's dropdown has the pane's focus, so the pane can hold still under it.
+  on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const moved = await next(e)
+    const element = moved.deny === undefined ? e.element : undefined
+    const held = element?.startsWith('limit-') ? element : null
+    if ((await read($, heldAtom)) !== held) await update($, heldAtom, () => held)
+    return moved
+  }).catch(($, e, next) => next(e))
+
   // The pane: what this prompt is spending, the settings, recent prompts.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Input, Select, Text } = $.ui.resolve(e)
+    // Each redraw puts a dropdown's highlight back on its value, and the run moves every step,
+    // so while a setting's dropdown holds the focus the pane draws the run it last drew.
+    const isHeld = (await read($, heldAtom)) !== null && paneRun !== null
     const [run, limits, plan, history, editing, isRecentOpen] = await Promise.all([
-      read($, runAtom),
+      isHeld ? paneRun : read($, runAtom),
       read($, limitsAtom),
       read($, planAtom),
       read($, historyAtom),
       read($, editingAtom),
       read($, recentOpenAtom),
     ])
-    const now = await $.clock.now()
+    paneRun = run
+    const now = isHeld ? paneNow : await $.clock.now()
+    paneNow = now
     const icon = iconFor($, e)
     const isLive = run !== null && run.status !== 'done'
     const columns = e.props.bodyColumns ?? 60
 
-    const setLimit = async (key: keyof FenceLimits, value: FenceLimits[keyof FenceLimits]) => {
-      const next = await update($, limitsAtom, l => ({ ...l, [key]: value }))
-      await $.store.set(STORE_KEY, next)
-      await update($, runAtom, r => (r && r.status !== 'done' ? withLimitChanged(r, key) : r))
-    }
+    const setLimit = (key: keyof FenceLimits, value: FenceLimits[keyof FenceLimits]) => saveLimit($, key, value)
 
     const heading = (text: string, trailing?: RenderChildren) => (
       <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap="md">
@@ -800,7 +934,7 @@ function titleOf(entry: FenceHistoryEntry): string {
   return `Untitled prompt, ${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${resetTime(at.toISOString()) ?? ''}`.trim()
 }
 
-type IconName = 'clock' | 'tokens' | 'session' | 'weekly' | 'shield' | 'shieldOff'
+type IconName = 'clock' | 'tokens' | 'session' | 'weekly' | 'shield' | 'shieldOff' | 'pause' | 'stop'
 
 /** A neutral gray that reads on light and dark backgrounds alike (an SVG image cannot take the theme's color). */
 const ICON_STROKE = '#8b919c'
@@ -816,14 +950,18 @@ const ICON_COLORS: Record<IconName, string> = {
   weekly: '#e0874f',
   shield: '#3fa65f',
   shieldOff: ICON_STROKE,
+  pause: '#e0a32f',
+  stop: '#e0524f',
 }
-const GLYPH_COLORS: Record<IconName, 'suggestion' | 'merged' | 'planMode' | 'claude' | 'success' | 'subtle'> = {
+const GLYPH_COLORS: Record<IconName, 'suggestion' | 'merged' | 'planMode' | 'claude' | 'success' | 'subtle' | 'warning' | 'error'> = {
   clock: 'suggestion',
   tokens: 'merged',
   session: 'planMode',
   weekly: 'claude',
   shield: 'success',
   shieldOff: 'subtle',
+  pause: 'warning',
+  stop: 'error',
 }
 
 /** The band's gauges in reading order, each with the pane's icon for it. */
@@ -837,6 +975,9 @@ const ACCENT_HEX = '#4f8fe0'
 /** How much closer another limit must be before it takes the bar. */
 const LEAD_MARGIN = 0.05
 const TRACK = 'rgba(139, 145, 156, 0.25)'
+/** Darker than the bar's track: a 1px line at the track's alpha disappears on a dark backdrop. */
+const DIVIDER = 'rgba(139, 145, 156, 0.45)'
+const DIVIDER_HEIGHT = 12
 const WARNING_HEX = '#e0a32f'
 const ERROR_HEX = '#e0524f'
 
@@ -859,6 +1000,8 @@ const ICON_PATHS: Record<IconName, string> = {
   weekly: badgedGauge('7d', '#e0874f'),
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
   shieldOff: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 9l6 6M15 9l-6 6"/>',
+  pause: '<circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/>',
+  stop: '<circle cx="12" cy="12" r="9"/><rect x="9" y="9" width="6" height="6" rx="1"/>',
 }
 
 /** The terminal draws no SVG: a glyph of the same idea stands in. */
@@ -869,6 +1012,8 @@ const ICON_GLYPHS: Record<IconName, string> = {
   weekly: '◔ʷ',
   shield: '◆',
   shieldOff: '◇',
+  pause: '‖',
+  stop: '■',
 }
 
 

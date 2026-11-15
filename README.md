@@ -11,8 +11,8 @@ Pauses a prompt before it runs too long, uses too many tokens, or eats too much 
   - **This prompt / Last prompt**: time, tokens, and its share of the session and weekly limits, amber near a limit and red at it
   - **Pause a prompt after**: one dropdown per limit, each with presets, **No limit**, and **Custom…** for any value you type. Changes apply to the prompt already running.
   - **Recent prompts**, collapsed by default, and **View all** for the full history (kept across sessions)
-- **While Claude works**, one row above the prompt shows the limit closest to its cap as its icon, a bar, and `used / limit` (`3m left` in amber near it, red when paused), and each other limit as its icon and a percent. On a narrow window the other limits drop off first. **⋯** opens the pane.
-- **When a limit is reached**, the next tool call waits on the app's own approval prompt. Allow raises that limit by half; Deny tells Claude it hit your fence, and it wraps up.
+- **While Claude works**, one row above the prompt shows the limit closest to its cap as its icon, a bar, and `used / limit` (amber from 80%, red at the limit; when a limit trips, a Paused or Stopped status with its own icon leads the row in the same color as the pane shows it), and each other limit as its icon and a percent. On a narrow window the other limits drop off first. **⋯** opens the pane.
+- **When a limit is reached**, the next tool call waits on a question in the prompt box: **Continue and raise** that limit (by half, past what the prompt has used), **Stop here**, or **Open Budget fence** to change any limit, then continue or stop. Type a value under Other to set the limit yourself, or anything else to stop and tell Claude why. Stopping tells Claude it hit your fence, and it wraps up.
 
 The fence never tells Claude about the budget, so it never cuts corners to fit. It only watches and asks.
 

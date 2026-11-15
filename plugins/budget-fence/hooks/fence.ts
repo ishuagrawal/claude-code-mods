@@ -309,9 +309,30 @@ export function tripOf(run: FenceRun, limits: FenceLimits, now: number): Trip | 
   return null
 }
 
+/** A paused run going on, with the time it waited left out of its clock. */
+export function withResumed(run: FenceRun, now: number): FenceRun {
+  return { ...run, ...endPause(run, now), status: 'running', reason: null, pausedToolUseId: null }
+}
+
+/**
+ * The setting to offer when a limit trips: half again, and always past what the
+ * prompt has used, rounded to a value the dropdowns read cleanly.
+ */
+export function raisedLimit(gauge: Gauge, limit: number, used: number): number {
+  const n = Math.max(limit * (1 + RAISE), used * 1.25)
+  switch (gauge) {
+    case 'minutes':
+      return Math.ceil(n)
+    case 'tokens':
+      return n >= 100_000 ? Math.ceil(n / 10_000) * 10_000 : Math.ceil(n / 1_000) * 1_000
+    default:
+      return n >= 1 ? Math.ceil(n) : Math.ceil(n * 10) / 10
+  }
+}
+
 /** What allowing a paused call grants: room past the limit that tripped. */
 export function withAllowed(run: FenceRun, limits: FenceLimits, trip: Trip, now: number): FenceRun {
-  const resumed = { ...run, ...endPause(run, now), status: 'running' as const, reason: null, pausedToolUseId: null }
+  const resumed = withResumed(run, now)
   const g = gaugeOf(run, limits, trip.kind, now)
   if (!g) return resumed
   return { ...resumed, bonus: { ...run.bonus, [trip.kind]: g.used - g.base + g.base * RAISE } }

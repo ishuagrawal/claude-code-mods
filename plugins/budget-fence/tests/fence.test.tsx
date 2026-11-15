@@ -1,4 +1,5 @@
 import { expect, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
 import {
   DEFAULT_LIMITS as DEFAULTS,
@@ -371,4 +372,170 @@ test('recent prompts start collapsed and open on a press', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: 'tidy the README' }))?.text).toBe('tidy the README')
   expect((await ui.find({ type: 'Text', text: /tokens/ }))?.text).toBe('1m · 1k tokens · ~0.3% of weekly')
   await ui.unmount()
+})
+
+/** A prompt running for 2 minutes against a 1-minute limit, its question answered by `answers` in turn. */
+async function trippedPrompt(
+  $: Parameters<TestBody>[0],
+  on: Parameters<TestBody>[1],
+  answers: string[],
+  verdict: 'allow' | 'ask' = 'allow',
+) {
+  const asked: { question: string; options: string[] }[] = []
+  const opened: string[] = []
+  const saved: unknown[] = []
+  let t = 0
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, minutes: 1 } : undefined }))
+  on('store.set', (_, e) => {
+    if ((e as { key: string }).key === 'limits') saved.push((e as { value: unknown }).value)
+    return { value: undefined }
+  })
+  on('clock.now', () => ({ value: t }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('ui.open', (_, e) => {
+    opened.push((e as { id: string }).id)
+    return { value: { isPlaced: true } } as never
+  })
+  on('tool.check', { tool: 'Bash' }, () => ({ decision: verdict }))
+  on('tool.call', { tool: 'AskUserQuestion' }, (_, e) => {
+    const q = (e as unknown as { questions: { question: string; options: { label: string }[] }[] }).questions[0]!
+    asked.push({ question: q.question, options: q.options.map(o => o.label) })
+    return { result: { questions: [q], answers: { [q.question]: answers.shift() ?? 'Stop here' } } } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  t = 120_000
+  const result = await $.tool.check({ tool: 'Bash', input: {}, tool_use_id: 'u1', approver: 'person' } as never)
+  return { result, asked, opened, saved }
+}
+
+test('a tripped limit asks in the prompt box, and Continue raises that setting', async ($, on) => {
+  const { result, asked, saved } = await trippedPrompt($, on, ['Continue and raise the time limit to 3 min'])
+  expect(asked).toEqual([
+    {
+      question: 'This prompt has used 2m, past its time limit of 1 min. Keep working?',
+      options: ['Continue and raise the time limit to 3 min', 'Stop here', 'Open Budget fence'],
+    },
+  ])
+  expect(result.decision).toBe('allow')
+  expect(saved).toEqual([{ isOn: true, minutes: 3, tokens: 0, share: 0, weeklyShare: 0 }])
+})
+
+test('continuing keeps the app’s own permission check for the call', async ($, on) => {
+  const { result } = await trippedPrompt($, on, ['Continue and raise the time limit to 3 min'], 'ask')
+  expect(result.decision).toBe('ask')
+})
+
+test('Open Budget fence opens the pane and asks again; Stop denies the call', async ($, on) => {
+  const { result, asked, opened, saved } = await trippedPrompt($, on, ['Open Budget fence', 'Stop here'])
+  expect(opened).toEqual(['budget-fence'])
+  expect(asked.map(a => a.options)).toEqual([
+    ['Continue and raise the time limit to 3 min', 'Stop here', 'Open Budget fence'],
+    ['Continue with the limits as set', 'Continue and raise the time limit to 3 min', 'Stop here'],
+  ])
+  expect(result.decision).toBe('deny')
+  expect(saved).toEqual([])
+})
+
+test('a value typed under Other sets the limit; other words go to Claude', async ($, on) => {
+  const typed = await trippedPrompt($, on, ['1m', '10m'])
+  expect(typed.asked[1]?.question).toBe('1 min is no more than it has used. This prompt has used 2m, past its time limit of 1 min. Keep working?')
+  expect(typed.result.decision).toBe('allow')
+  expect(typed.saved).toEqual([{ isOn: true, minutes: 10, tokens: 0, share: 0, weeklyShare: 0 }])
+})
+
+test('words typed under Other stop the call and reach Claude', async ($, on) => {
+  const { result } = await trippedPrompt($, on, ['wrap up the tests first'])
+  expect(result.decision).toBe('deny')
+  expect(result.reason).toContain('saying: wrap up the tests first')
+})
+
+test('a finished prompt keeps its numbers when usage moves later', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] },
+  }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('session.measure', () => ({ changed: [] }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ turnId: 't1', reason: 'answer', answer: '', durationMs: 0, isAborted: false })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const before = (await ui.find({ type: 'Text', text: /%/ }))?.text
+  await $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 70 }], changed: ['rateLimits'] } as never)
+  expect((await ui.find({ type: 'Text', text: /%/ }))?.text).toBe(before)
+  expect(before).toBe('<1%')
+  await ui.unmount()
+})
+
+test('every band state reads "used / limit", with an icon on each status, on both surfaces', async ($, on) => {
+  let t = 0
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, minutes: 10, tokens: 1_000_000 } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: t }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('tool.check', { tool: 'Bash' }, () => ({ decision: 'allow' }))
+  on('tool.call', { tool: 'AskUserQuestion' }, (_, e) => {
+    const q = (e as unknown as { questions: { question: string }[] }).questions[0]!
+    return { result: { questions: [q], answers: { [q.question]: 'Stop here' } } } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+
+  const band = async (surface: 'terminal' | 'desktop') => {
+    const ui = await $.ui.mount({
+      plugin: 'budget-fence',
+      component: 'AbovePrompt',
+      requestId: 'band',
+      surface,
+      props: { hasSurvey: false, isCollapsed: false, bodyColumns: 80, maxRows: 4 },
+    } as never)
+    const texts = (await ui.findAll({ type: 'Text' })).map(x => x.text)
+    const svgs = surface === 'desktop' ? (await ui.findAll({ type: 'Svg' })).map(x => x.props.alt as string) : []
+    const fig = texts.find(x => / \/ /.test(x))
+    const word = texts.find(x => x === 'Paused' || x === 'Stopped')
+    const icons = svgs.filter(Boolean)
+    const dividers = surface === 'desktop' ? svgs.filter(x => x === '').length : texts.filter(x => x === '│').length
+    await ui.unmount()
+    return { fig, word, icons, dividers }
+  }
+
+  t = 2 * 60_000
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await band(surface)).toEqual({
+      fig: '2m / 10m',
+      word: undefined,
+      icons: surface === 'desktop' ? ['Time', '20% of the limit', 'Tokens'] : [],
+      dividers: 1,
+    })
+  }
+  t = 9 * 60_000
+  expect((await band('desktop')).fig).toBe('9m / 10m')
+
+  t = 11 * 60_000
+  await $.tool.check({ tool: 'Bash', input: {}, tool_use_id: 'u1', approver: 'host' } as never)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await band(surface)).toEqual({
+      fig: '11m / 10m',
+      word: 'Paused',
+      icons: surface === 'desktop' ? ['Paused', 'Time', '100% of the limit'] : [],
+      dividers: 1,
+    })
+  }
+
+  await $.tool.check({ tool: 'Bash', input: {}, tool_use_id: 'u2', approver: 'person' } as never)
+  const stopped = await band('desktop')
+  expect([stopped.word, stopped.icons[0], stopped.fig]).toEqual(['Stopped', 'Stopped', '11m / 10m'])
 })

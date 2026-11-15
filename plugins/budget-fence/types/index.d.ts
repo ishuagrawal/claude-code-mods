@@ -111,6 +111,8 @@ declare module 'claude-code' {
       /** The setting whose custom value is being typed, and why the last try was refused. */
       editing: Shaped<{ key: string; error: string | null } | null>
       plan: Shaped<{ hasSession: boolean; hasWeekly: boolean } | null>
+      /** The setting whose dropdown holds the pane's focus; while set, the pane stops following the run. */
+      held: Shaped<string | null>
     }
   }
 }
