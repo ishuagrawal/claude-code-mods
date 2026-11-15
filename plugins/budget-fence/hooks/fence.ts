@@ -284,7 +284,7 @@ export type GaugeReading = { used: number; cap: number; base: number; share?: Sh
 
 export function gaugeOf(run: FenceRun, limits: FenceLimits, gauge: Gauge, now: number): GaugeReading | null {
   const base = limits[gauge]
-  const cap = base === 0 ? 0 : base + run.bonus[gauge]
+  const cap = base === 0 || run.isUnfenced ? 0 : base + run.bonus[gauge]
   switch (gauge) {
     case 'minutes':
       return { used: activeMs(run, now) / 60_000, cap, base }
@@ -338,10 +338,16 @@ export function withAllowed(run: FenceRun, limits: FenceLimits, trip: Trip, now:
   return { ...resumed, bonus: { ...run.bonus, [trip.kind]: g.used - g.base + g.base * RAISE } }
 }
 
-/** A limit the person just changed takes effect as set, dropping room an earlier Allow gave. */
+/** The rest of this prompt runs with no limits; the settings stay as they are for the next one. */
+export function withUnfenced(run: FenceRun): FenceRun {
+  return { ...run, isUnfenced: true }
+}
+
+/** A limit the person just changed takes effect as set, dropping room an earlier Allow gave and any choice to go on unlimited. */
 export function withLimitChanged(run: FenceRun, key: keyof FenceLimits): FenceRun {
-  if (key in run.bonus) return { ...run, bonus: { ...run.bonus, [key]: 0 } }
-  return run
+  const fenced = { ...run, isUnfenced: false }
+  if (key in run.bonus) return { ...fenced, bonus: { ...run.bonus, [key]: 0 } }
+  return fenced
 }
 
 export function withPaused(run: FenceRun, trip: Trip, toolUseId: string | null, now: number): FenceRun {

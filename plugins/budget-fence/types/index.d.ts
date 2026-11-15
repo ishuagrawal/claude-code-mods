@@ -74,6 +74,8 @@ export type FenceRun = {
   reason: string | null
   pausedToolUseId: string | null
   pauses: number
+  /** The person chose to go on with no limits: nothing trips for the rest of this prompt. */
+  isUnfenced?: boolean
 }
 
 /** A finished prompt as the history keeps it. */
@@ -111,8 +113,6 @@ declare module 'claude-code' {
       /** The setting whose custom value is being typed, and why the last try was refused. */
       editing: Shaped<{ key: string; error: string | null } | null>
       plan: Shaped<{ hasSession: boolean; hasWeekly: boolean } | null>
-      /** The setting whose dropdown holds the pane's focus; while set, the pane stops following the run. */
-      held: Shaped<string | null>
     }
   }
 }

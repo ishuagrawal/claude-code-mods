@@ -417,11 +417,25 @@ test('a tripped limit asks in the prompt box, and Continue raises that setting',
   expect(asked).toEqual([
     {
       question: 'This prompt has used 2m, past its time limit of 1 min. Keep working?',
-      options: ['Continue and raise the time limit to 3 min', 'Stop here', 'Open Budget fence'],
+      options: ['Continue with no limits', 'Continue and raise the time limit to 3 min', 'Stop here', 'Open Budget fence'],
     },
   ])
   expect(result.decision).toBe('allow')
   expect(saved).toEqual([{ isOn: true, minutes: 3, tokens: 0, share: 0, weeklyShare: 0 }])
+})
+
+test('Continue with no limits lets the rest of the prompt run without asking, and leaves the settings alone', async ($, on) => {
+  const { result, asked, saved } = await trippedPrompt($, on, ['Continue with no limits'])
+  expect(result.decision).toBe('allow')
+  expect(saved).toEqual([])
+  const later = await $.tool.check({ tool: 'Bash', input: {}, tool_use_id: 'u2', approver: 'person' } as never)
+  expect(later.decision).toBe('allow')
+  expect(asked.length).toBe(1)
+})
+
+test('a limit changed after going on unlimited fences the prompt again', () => {
+  const run = { ...newRun('r', 0, []), isUnfenced: true }
+  expect(withLimitChanged(run, 'minutes').isUnfenced).toBe(false)
 })
 
 test('continuing keeps the app’s own permission check for the call', async ($, on) => {
@@ -433,8 +447,8 @@ test('Open Budget fence opens the pane and asks again; Stop denies the call', as
   const { result, asked, opened, saved } = await trippedPrompt($, on, ['Open Budget fence', 'Stop here'])
   expect(opened).toEqual(['budget-fence'])
   expect(asked.map(a => a.options)).toEqual([
-    ['Continue and raise the time limit to 3 min', 'Stop here', 'Open Budget fence'],
-    ['Continue with the limits as set', 'Continue and raise the time limit to 3 min', 'Stop here'],
+    ['Continue with no limits', 'Continue and raise the time limit to 3 min', 'Stop here', 'Open Budget fence'],
+    ['Continue with no limits', 'Continue with the limits as set', 'Continue and raise the time limit to 3 min', 'Stop here'],
   ])
   expect(result.decision).toBe('deny')
   expect(saved).toEqual([])
@@ -538,4 +552,124 @@ test('every band state reads "used / limit", with an icon on each status, on bot
   await $.tool.check({ tool: 'Bash', input: {}, tool_use_id: 'u2', approver: 'person' } as never)
   const stopped = await band('desktop')
   expect([stopped.word, stopped.icons[0], stopped.fig]).toEqual(['Stopped', 'Stopped', '11m / 10m'])
+})
+
+test('the pane holds still while a setting has the focus, then catches up', async ($, on) => {
+  let draws = 0
+  let isDrawing = false
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, share: 10 } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  // The pane asks the time once per drawing; the test counts drawings by it.
+  on('clock.now', () => {
+    if (isDrawing) draws += 1
+    return { value: 0 }
+  })
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] },
+  }))
+  on('session.measure', () => ({ changed: [] }))
+  // The ring lands wherever the person sends it.
+  on('ui.focus', { plugin: '*' }, () => ({}) as never)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, isFocused: true } })
+  const hint = async () => (await ui.find({ type: 'Text', text: /of 10% used/ }))?.text
+  const measure = (percentUsed: number) =>
+    $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed }], changed: ['rateLimits'] } as never)
+  expect(await hint()).toBe('<1% of 10% used')
+
+  isDrawing = true
+  const focus = (element: string) =>
+    $.ui.focus({ requestId: 'budget-fence', key: element, component: 'Pane', plugin: 'budget-fence', element, origin: { kind: 'person' } } as never)
+  expect((await focus('limit-share')).deny).toBe(undefined)
+  await measure(42)
+  await measure(43)
+  // Neither the focus landing nor the run moving drew the pane again.
+  expect(draws).toBe(0)
+  expect(await hint()).toBe('<1% of 10% used')
+
+  await focus('toggle')
+  expect(await hint()).toBe('~3.0% of 10% used')
+  expect(draws).toBe(1)
+  await measure(44)
+  expect(await hint()).toBe('~4.0% of 10% used')
+
+  // Focus that leaves the pane without a move reported still frees the figures.
+  await focus('limit-share')
+  await measure(45)
+  expect(await hint()).toBe('~4.0% of 10% used')
+  await ui.redraw({ ...PANE.props, isFocused: false })
+  await measure(46)
+  expect(await hint()).toBe('~6.0% of 10% used')
+  await ui.unmount()
+})
+
+
+test('a drawing asked only because the pane took the focus waits while a setting dropdown has it', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, share: 10 } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.measure', () => ({ changed: [] }))
+  // The 30-second cap never runs out here: only a release lets a held drawing go.
+  on('clock.sleep', () => new Promise(() => undefined) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('ui.focus', { plugin: '*' }, () => ({}) as never)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const focus = (element: string) =>
+    $.ui.focus({ requestId: 'budget-fence', key: element, component: 'Pane', plugin: 'budget-fence', element, origin: { kind: 'person' } } as never)
+  const settle = async () => {
+    for (let i = 0; i < 10; i += 1) await $.session.measure({ context: { window: 200000 }, rateLimits: [], changed: [] } as never)
+  }
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // A click on a dropdown: the focus lands on it, then the pane takes the focus.
+  await focus('limit-share')
+  let isDrawn = false
+  const drawn = ui.redraw({ ...PANE.props, isFocused: true }).then(() => {
+    isDrawn = true
+  })
+  await settle()
+  expect(isDrawn).toBe(false)
+  // The focus moving off the settings lets it draw.
+  await focus('toggle')
+  await drawn
+  expect(isDrawn).toBe(true)
+
+  // Again, and this time a pick closes the dropdown: the held drawing carries it.
+  await ui.redraw({ ...PANE.props, isFocused: false })
+  await focus('limit-tokens')
+  isDrawn = false
+  const picked = ui.redraw({ ...PANE.props, isFocused: true }).then(() => {
+    isDrawn = true
+  })
+  await settle()
+  expect(isDrawn).toBe(false)
+  // The desktop asks again as the button comes up, the same props: it waits its turn too.
+  let isRepeatDrawn = false
+  const repeated = ui.redraw({ ...PANE.props, isFocused: true }).then(() => {
+    isRepeatDrawn = true
+  })
+  await settle()
+  expect([isDrawn, isRepeatDrawn]).toEqual([false, false])
+  // The pick lands on the dropdown on screen, and both drawings follow it, in turn.
+  await ui.select({ key: 'limit-tokens', value: '250000' })
+  await Promise.all([picked, repeated])
+  expect((await ui.find({ type: 'Select', key: 'limit-tokens' }))?.props.value).toBe('250000')
+
+  // With no dropdown in focus the same move draws at once.
+  await ui.redraw({ ...PANE.props, isFocused: false })
+  await ui.redraw({ ...PANE.props, isFocused: true })
+  await ui.unmount()
+
+  // The terminal draws its own focus ring: it never waits.
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await focus('limit-share')
+  await term.redraw({ ...PANE.props, isFocused: true })
+  await term.unmount()
 })

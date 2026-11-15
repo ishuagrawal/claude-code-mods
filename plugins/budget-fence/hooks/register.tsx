@@ -34,6 +34,7 @@ import {
   withResumed,
   raisedLimit,
   withStep,
+  withUnfenced,
   historyEntryOf,
   withHistory,
   limitLabel,
@@ -55,7 +56,55 @@ const CALIBRATION_KEY = 'calibration'
 const editingAtom = atom({ plugin: 'budget-fence', key: 'editing' } as const, null, { shape: 'editing-1' })
 const recentOpenAtom = atom({ plugin: 'budget-fence', key: 'recentOpen' } as const, false, { shape: 'recent-1' })
 const planAtom = atom({ plugin: 'budget-fence', key: 'plan' } as const, null, { shape: 'plan-1' })
-const heldAtom = atom({ plugin: 'budget-fence', key: 'held' } as const, null, { shape: 'held-1' })
+
+/**
+ * What the pane draws of the prompt, kept here rather than read while drawing:
+ * a read subscribes the pane, every write then redraws it, and a redraw puts an
+ * open dropdown's highlight back on its value. The run moves every step, so the
+ * pane is redrawn by hand, and not while one of its settings has the focus.
+ */
+const pane = {
+  run: null as FenceRun | null,
+  history: [] as FenceHistoryEntry[],
+  /** The setting whose dropdown holds the pane's focus ring. */
+  focus: null as string | null,
+  /** Whether the pane skipped a redraw while a setting had the focus. */
+  isStale: false,
+  /** The props of the last drawing, `isFocused` left out, and its `isFocused`. */
+  drawnProps: null as string | null,
+  wasFocused: false,
+  /** Drawings held back while a setting's dropdown is open, each waiting for `releasePane`. */
+  held: [] as (() => void)[],
+  /** The pane's drawing in progress: each waits for the one before, so none answers out of turn. */
+  drawing: Promise.resolve() as Promise<unknown>,
+}
+
+/**
+ * Runs one drawing of the pane after the one before it has answered. An answer
+ * that lands after a newer one leaves the surface pressing the older drawing's
+ * dropdowns, so a pick goes nowhere; and a request repeated while one is held
+ * back waits behind it instead of drawing over an open dropdown.
+ */
+function drawInTurn<T>(draw: () => Promise<T>): Promise<T> {
+  const drawn = pane.drawing.then(draw)
+  pane.drawing = drawn.catch(() => undefined)
+  return drawn
+}
+
+/** Lets every held-back drawing answer. */
+function releasePane() {
+  for (const release of pane.held.splice(0)) release()
+}
+
+/** Redraws the pane for what changed, or leaves it for when the focus moves off a setting. */
+function refreshPane($: EngineInterface) {
+  if (pane.focus !== null) {
+    pane.isStale = true
+    return
+  }
+  pane.isStale = false
+  $.ui.invalidate('ui.render')
+}
 
 /** Saved limits, checked key by key and filled out with the defaults. */
 function savedLimits(value: unknown): FenceLimits | null {
@@ -91,15 +140,39 @@ async function notePlan($: EngineInterface, readings: readonly Reading[]) {
   if (was?.hasSession !== plan.hasSession || was?.hasWeekly !== plan.hasWeekly) await update($, planAtom, () => plan)
 }
 
-/**
- * `update` for the run, writing nothing when `fn` hands back the run it was
- * given: every write redraws the pane, which puts an open dropdown's highlight
- * back on its value.
- */
+/** `update` for the run, writing nothing when `fn` hands back the run it was given. */
 async function changeRun($: EngineInterface, fn: (run: FenceRun | null) => FenceRun | null) {
   const run = await read($, runAtom)
   if (fn(run) === run) return
-  await update($, runAtom, fn)
+  pane.run = await update($, runAtom, fn)
+  refreshPane($)
+}
+
+/** Writes the history, for the pane to draw when it next can. */
+async function changeHistory($: EngineInterface, fn: (list: FenceHistoryEntry[]) => FenceHistoryEntry[]) {
+  pane.history = await update($, historyAtom, list => fn(list ?? []))
+  refreshPane($)
+  return pane.history
+}
+
+/**
+ * A pick from a setting's dropdown: Custom… opens its field; any other value is
+ * saved. A pick closes the dropdown, so a drawing held back for it answers.
+ */
+async function pickLimit($: EngineInterface, key: Gauge, picked: string) {
+  try {
+    if (picked === CUSTOM) {
+      await update($, editingAtom, () => ({ key, error: null }))
+      return
+    }
+    const value = Number(picked)
+    if (!Number.isFinite(value) || value < 0) return
+    // Closes this setting's custom field, writing nothing when it was not open.
+    if ((await read($, editingAtom))?.key === key) await update($, editingAtom, () => null)
+    await saveLimit($, key, value)
+  } finally {
+    releasePane()
+  }
 }
 
 /** Saves one setting, applying it to the prompt already running. */
@@ -119,11 +192,12 @@ const LIMIT_NAMES: Record<Gauge, string> = {
 const STOP = 'Stop here'
 const OPEN = 'Open Budget fence'
 const KEEP = 'Continue with the limits as set'
+const UNLIMITED = 'Continue with no limits'
 
 /**
  * Asks, where the prompt box is, whether to go on past a tripped limit:
- * continue and raise that setting, stop, or open the pane to change any of
- * them. Text typed under Other is read as a new value for the tripped limit,
+ * continue with no limits for the rest of this prompt, continue and raise
+ * that setting, stop, or open the pane to change any of them. Text typed under Other is read as a new value for the tripped limit,
  * and otherwise handed to Claude as the person's words.
  */
 export async function askToContinue($: EngineInterface, trip: Trip): Promise<{ go: true } | { go: false; said?: string }> {
@@ -142,13 +216,17 @@ export async function askToContinue($: EngineInterface, trip: Trip): Promise<{ g
     try {
       answer = await $.ui.ask(question, {
         header: 'Budget fence',
-        options: hasOpened ? [KEEP, raise, STOP] : [raise, STOP, OPEN],
+        options: hasOpened ? [UNLIMITED, KEEP, raise, STOP] : [UNLIMITED, raise, STOP, OPEN],
       })
     } catch {
       // Dismissed: nobody said go on.
       return { go: false }
     }
     if (answer === STOP) return { go: false }
+    if (answer === UNLIMITED) {
+      await changeRun($, r => (r ? withUnfenced(r) : r))
+      return { go: true }
+    }
     if (answer === raise) {
       await saveLimit($, trip.kind, raised)
       return { go: true }
@@ -179,9 +257,6 @@ export async function askToContinue($: EngineInterface, trip: Trip): Promise<{ g
 }
 
 export const register: Register = on => {
-  // The run the pane last drew, kept while a setting's dropdown holds the focus.
-  let paneRun: FenceRun | null = null
-  let paneNow = 0
   // One question at a time: calls that trip while it is open share its answer.
   let asking: ReturnType<typeof askToContinue> | null = null
   // Calls paused by the fence, by tool_use_id: what tripped, and in which loop.
@@ -200,6 +275,10 @@ export const register: Register = on => {
     })
     const history = await $.store.get(HISTORY_KEY)
     if (Array.isArray(history)) await update($, historyAtom, () => history as FenceHistoryEntry[])
+    // A reload starts the module over; the session's values outlive it.
+    pane.run = await read($, runAtom)
+    pane.history = await read($, historyAtom)
+    pane.focus = null
     const saved = savedLimits(await $.store.get(STORE_KEY))
     if (saved) await update($, limitsAtom, () => saved)
     await notePlan($, (await $.session.usage()).rateLimits)
@@ -327,7 +406,7 @@ export const register: Register = on => {
     if (finished) {
       await $.store.set(CALIBRATION_KEY, withCalibrated(await calibration($), finished))
       const entry = historyEntryOf(finished, e.agentId === undefined ? completed.text : '')
-      const history = await update($, historyAtom, list => withHistory(list ?? [], entry))
+      const history = await changeHistory($, list => withHistory(list, entry))
       await $.store.set(HISTORY_KEY, history)
       const limits = await read($, limitsAtom)
       const receipt = receiptOf(finished, limits)
@@ -525,32 +604,51 @@ export const register: Register = on => {
     )
   })
 
-  // Which setting's dropdown has the pane's focus, so the pane can hold still under it.
+  // Which setting's dropdown has the pane's focus, kept in memory: a write here
+  // would redraw the pane as the dropdown takes the focus.
   on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const moved = await next(e)
-    const element = moved.deny === undefined ? e.element : undefined
-    const held = element?.startsWith('limit-') ? element : null
-    if ((await read($, heldAtom)) !== held) await update($, heldAtom, () => held)
+    if (moved.deny !== undefined) return moved
+    pane.focus = e.element?.startsWith('limit-') ? e.element : null
+    if (pane.focus === null) releasePane()
+    // Off the settings: draw what changed meanwhile.
+    if (pane.focus === null && pane.isStale) refreshPane($)
     return moved
   }).catch(($, e, next) => next(e))
 
   // The pane: what this prompt is spending, the settings, recent prompts.
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+  on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawInTurn(async () => {
     const { Box, Button, Input, Select, Text } = $.ui.resolve(e)
-    // Each redraw puts a dropdown's highlight back on its value, and the run moves every step,
-    // so while a setting's dropdown holds the focus the pane draws the run it last drew.
-    const isHeld = (await read($, heldAtom)) !== null && paneRun !== null
-    const [run, limits, plan, history, editing, isRecentOpen] = await Promise.all([
-      isHeld ? paneRun : read($, runAtom),
+    // A pane without the keyboard has no setting in focus, whatever the last move said:
+    // the live figures never stay frozen behind a focus that left without a word.
+    if (!e.props.isFocused) pane.focus = null
+    // The desktop asks for a drawing when the pane takes the focus, which a click on a
+    // setting's dropdown does, and only once the button is up: the drawing lands with the
+    // dropdown open, rebuilds it and puts its highlight back on its value under the
+    // pointer. Nothing drawn reads `isFocused`, so a drawing asked for that alone, with a
+    // dropdown in focus, waits for the pick or the focus to move on (or 30s at most).
+    // What was drawn is noted before any wait, so a later drawing is compared with itself.
+    const drawnProps = JSON.stringify({ ...e.props, isFocused: undefined })
+    const isFocusMoveAlone = drawnProps === pane.drawnProps && e.props.isFocused !== pane.wasFocused
+    pane.drawnProps = drawnProps
+    pane.wasFocused = e.props.isFocused
+    if (e.surface === 'desktop' && isFocusMoveAlone && pane.focus !== null) {
+      await Promise.race([new Promise<void>(release => pane.held.push(release)), $.clock.sleep(30_000)])
+    } else {
+      // A drawing for anything else stands in for one held back.
+      releasePane()
+    }
+    // The run and the history come from memory, not a read (see `pane`), and after any
+    // wait, so a held drawing shows the prompt as it stands.
+    const { run, history } = pane
+    pane.isStale = false
+    const [limits, plan, editing, isRecentOpen] = await Promise.all([
       read($, limitsAtom),
       read($, planAtom),
-      read($, historyAtom),
       read($, editingAtom),
       read($, recentOpenAtom),
     ])
-    paneRun = run
-    const now = isHeld ? paneNow : await $.clock.now()
-    paneNow = now
+    const now = await $.clock.now()
     const icon = iconFor($, e)
     const isLive = run !== null && run.status !== 'done'
     const columns = e.props.bodyColumns ?? 60
@@ -599,14 +697,7 @@ export const register: Register = on => {
               key={`limit-${key}`}
               options={optionsFor(key, choices, value)}
               value={isEditing ? CUSTOM : String(value)}
-              onSelect={v =>
-                void (v === CUSTOM
-                  ? update($, editingAtom, () => ({ key, error: null }))
-                  : (async () => {
-                      await update($, editingAtom, cur => (cur?.key === key ? null : cur))
-                      await setLimit(key, Number(v))
-                    })())
-              }
+              onSelect={v => void pickLimit($, key, v)}
             />
           </Box>
           {isEditing ? (
@@ -767,7 +858,7 @@ export const register: Register = on => {
         ) : null}
       </Box>
     )
-  })
+  }))
 
   // The history: every recent prompt, newest first, with what it spent.
   on('ui.render', { component: 'Pane', requestId: HISTORY_PANE }, async ($, e) => {
@@ -796,7 +887,7 @@ export const register: Register = on => {
             label="Clear"
             onPress={() =>
               void (async () => {
-                await update($, historyAtom, () => [])
+                await changeHistory($, () => [])
                 await $.store.set(HISTORY_KEY, [])
               })()
             }
