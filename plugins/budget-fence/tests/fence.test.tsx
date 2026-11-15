@@ -137,6 +137,7 @@ test('before any prompt the pane shows the limits to set', async ($, on) => {
     expect(await ui.find({ type: 'Select', key: 'limit-window' })).toBe(undefined)
     expect(await ui.find({ type: 'Text', text: 'ALSO PAUSE WHEN' })).toBe(undefined)
     expect(await ui.find({ type: 'Text', text: 'Running' })).toBe(undefined)
+    expect(await ui.findAll({ type: 'Client' })).toEqual([])
     await ui.unmount()
   }
 })
@@ -265,10 +266,18 @@ test('a finished prompt shows its spend, the plan bars, icons, and lands in the 
   await $.turn.complete({ turnId: 't1', text: 'done', isAborted: false, reason: 'answer', answer: 'done' } as never)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: 'LAST PROMPT' }))?.text).toBe('LAST PROMPT')
+  expect((await ui.find({ type: 'Text', text: 'LAST PROMPT', in: 'live-head' }))?.text).toBe('LAST PROMPT')
   expect(await ui.find({ type: 'Text', text: 'YOUR PLAN' })).toBe(undefined)
   expect((await ui.find({ type: 'Svg' }))?.props.width).toBe(16)
-  expect((await ui.find({ type: 'Text', text: 'redesign the fence pane' }))?.text).toBe('redesign the fence pane')
+  expect((await ui.find({ type: 'Text', text: 'redesign the fence pane', in: 'live-head' }))?.text).toBe('redesign the fence pane')
+  // Each figure keeps its icon, drawn by the pane, over a column of the same width as its number's.
+  const svgs = (await ui.findAll({ type: 'Svg' })).map(x => x.props.alt as string)
+  expect(['Time', 'Tokens', 'Session', 'Weekly'].every(name => svgs.includes(name))).toBe(true)
+  // Each figure is its own column with a live block laid over it for the number and the fill.
+  expect((await ui.findAll({ type: 'Client' })).map(x => x.key).sort()).toEqual(['live-Session', 'live-Time', 'live-Tokens', 'live-Weekly', 'live-head'])
+  expect((await ui.find({ type: 'Text', text: /^0s$/, in: 'live-Time' }))?.text).toBe('0s')
+  // A finished prompt with no limit in force has no pie.
+  expect(await ui.find({ type: 'Text', text: /^[○◔◑◕●]$/, in: 'live-Time' })).toBe(undefined)
   await ui.unmount()
 
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -484,7 +493,7 @@ test('a finished prompt keeps its numbers when usage moves later', async ($, on)
   await $.turn.complete({ turnId: 't1', reason: 'answer', answer: '', durationMs: 0, isAborted: false })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const session = async () => (await ui.find({ type: 'Text', in: 'live-session' }))?.text
+  const session = async () => (await ui.find({ type: 'Text', text: /%$/, in: 'live-Session' }))?.text
   const before = await session()
   await $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 70 }], changed: ['rateLimits'] } as never)
   await ui.advance(1000)
@@ -556,7 +565,7 @@ test('every band state reads "used / limit", with an icon on each status, on bot
   expect([stopped.word, stopped.icons[0], stopped.fig]).toEqual(['Stopped', 'Stopped', '11m / 10m'])
 })
 
-test('a running prompt moves only its figures: the pane, its dropdowns and buttons are not drawn again', async ($, on) => {
+test('the prompt section keeps updating while a dropdown has focus, without drawing the pane again', async ($, on) => {
   let draws = 0
   let isDrawing = false
   on('command.register', () => ({ value: { command: 'fence' } }))
@@ -578,10 +587,11 @@ test('a running prompt moves only its figures: the pane, its dropdowns and butto
   await $.turn.start({ text: 'go', turnId: 't1' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, isFocused: true } })
-  const hint = async () => (await ui.find({ type: 'Text', in: 'live-hint-share' }))?.text
+  // The session figure against its limit, as the prompt's section shows it.
+  const hint = async () => (await ui.find({ type: 'Text', text: /^\S+ \/ 10%$/, in: 'live-Session' }))?.text
   const measure = (percentUsed: number) =>
     $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed }], changed: ['rateLimits'] } as never)
-  expect(await hint()).toBe('<1% of 10% used')
+  expect(await hint()).toBe('<1% / 10%')
 
   // Only the figures' own ticks ask for the clock from here on; drawings are counted apart.
   const drawsOf = async (act: () => Promise<unknown>) => {
@@ -595,29 +605,86 @@ test('a running prompt moves only its figures: the pane, its dropdowns and butto
   }
   expect(await drawsOf(() => measure(42))).toBe(0)
   await ui.advance(1000)
-  expect(await hint()).toBe('~2.0% of 10% used')
+  expect(await hint()).toBe('~2.0% / 10%')
 
-  // With a dropdown in focus too: the figure moves, the pane does not.
   const focus = (element: string) =>
     $.ui.focus({ requestId: 'budget-fence', key: element, component: 'Pane', plugin: 'budget-fence', element, origin: { kind: 'person' } } as never)
   await focus('limit-share')
   expect(await drawsOf(() => measure(44))).toBe(0)
   await ui.advance(1000)
-  expect(await hint()).toBe('~4.0% of 10% used')
+  expect(await hint()).toBe('~4.0% / 10%')
+  // The session figure's pie shows its limit over a quarter used, in the figure's own color.
+  const pie = await ui.find({ type: 'Text', text: /^[○◔◑◕●]$/, in: 'live-Session' })
+  expect([pie?.text, pie?.props.color]).toEqual(['◔', '#2fa7a0'])
   expect((await ui.find({ type: 'Select', key: 'limit-share' }))?.props.value).toBe('10')
   await ui.unmount()
 })
 
 
-test('a drawing asked only because the pane took the focus waits while a setting dropdown has it', async ($, on) => {
+test('the prompt section never goes back to older numbers when the pane is drawn from an older view', async ($, on) => {
+  let t = 0
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, minutes: 10 } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: t }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const time = async () => (await ui.find({ type: 'Text', text: /^\d.* \/ 10m$/, in: 'live-Time' }))?.text
+  expect(await time()).toBe('0s / 10m')
+  t = 65_000
+  await ui.advance(1000)
+  expect(await time()).toBe('1m 5s / 10m')
+  // A drawing worked out earlier than the block's last answer, as a repaint of the pane hands it.
+  t = 5_000
+  await ui.redraw({ ...PANE.props, bodyColumns: 71 })
+  expect(await time()).toBe('1m 5s / 10m')
+  t = 70_000
+  await ui.advance(1000)
+  expect(await time()).toBe('1m 10s / 10m')
+  await ui.unmount()
+})
+
+test('readings that land together leave the prompt section on the last one', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, share: 10 } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] },
+  }))
+  on('session.measure', () => ({ changed: [] }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const measure = (percentUsed: number) =>
+    $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed }], changed: ['rateLimits'] } as never)
+  await Promise.all([measure(42), measure(43), measure(44)])
+  await ui.advance(1000)
+  expect((await ui.find({ type: 'Text', text: /^\S+ \/ 10%$/, in: 'live-Session' }))?.text).toBe('~4.0% / 10%')
+  await ui.unmount()
+})
+
+test('desktop focus redraws wait when the dropdown focus event comes later', async ($, on) => {
+  let waits = 0
   on('command.register', () => ({ value: { command: 'fence' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, share: 10 } : undefined }))
   on('store.set', () => ({ value: undefined }))
   on('clock.now', () => ({ value: 0 }))
   on('session.measure', () => ({ changed: [] }))
-  // The 30-second cap never runs out here: only a release lets a held drawing go.
-  on('clock.sleep', () => new Promise(() => undefined) as never)
+  // Hold both timers so the test can deliver events in the host's order.
+  on('clock.sleep', () => {
+    waits += 1
+    return new Promise(() => undefined) as never
+  })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
   on('ui.focus', { plugin: '*' }, () => ({}) as never)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
@@ -628,13 +695,17 @@ test('a drawing asked only because the pane took the focus waits while a setting
   }
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // A click on a dropdown: the focus lands on it, then the pane takes the focus.
-  await focus('limit-share')
+  // The host requests the pane redraw before telling the mod which control gained focus.
   let isDrawn = false
   const drawn = ui.redraw({ ...PANE.props, isFocused: true }).then(() => {
     isDrawn = true
   })
   await settle()
+  expect(waits).toBe(1)
+  expect(isDrawn).toBe(false)
+  await focus('limit-share')
+  await settle()
+  expect(waits).toBe(2)
   expect(isDrawn).toBe(false)
   // The focus moving off the settings lets it draw.
   await focus('toggle')
@@ -662,9 +733,11 @@ test('a drawing asked only because the pane took the focus waits while a setting
   await Promise.all([picked, repeated])
   expect((await ui.find({ type: 'Select', key: 'limit-tokens' }))?.props.value).toBe('250000')
 
-  // With no dropdown in focus the same move draws at once.
+  // A host blur must release a pending render even before any focus event.
   await ui.redraw({ ...PANE.props, isFocused: false })
-  await ui.redraw({ ...PANE.props, isFocused: true })
+  const pending = ui.redraw({ ...PANE.props, isFocused: true })
+  await settle()
+  await Promise.all([pending, ui.redraw({ ...PANE.props, isFocused: false })])
   await ui.unmount()
 
   // The terminal draws its own focus ring: it never waits.

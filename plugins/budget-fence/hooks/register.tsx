@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, Register, RenderChildren, Space } from 'claude-code'
+import type { Elements, EngineInterface, Register, RenderChildren, RenderInput, Space } from 'claude-code'
 
 import type { FenceCalibration, FenceHistoryEntry, FenceLimits, FenceRun, FenceTally } from '../types'
 import {
@@ -41,7 +41,8 @@ import {
   parseLimitInput,
 } from './fence'
 import type { Gauge, Reading, Trip } from './fence'
-import type { LiveText } from './live'
+import { drawPrompt, pieOf, promptContent } from './live'
+import type { PromptPart, PromptStat, PromptView } from './live'
 
 const PANE = 'budget-fence'
 const TITLE = 'Budget fence'
@@ -59,54 +60,69 @@ const recentOpenAtom = atom({ plugin: 'budget-fence', key: 'recentOpen' } as con
 const planAtom = atom({ plugin: 'budget-fence', key: 'plan' } as const, null, { shape: 'plan-1' })
 
 /**
- * What the pane draws of the prompt, kept here rather than read while drawing:
- * a read subscribes the pane, every write then redraws it, and a redraw puts an
- * open dropdown's highlight back on its value. The run moves every step, so the
- * pane is redrawn by hand, and not while one of its settings has the focus.
+ * Keep the run and history here so reading them while drawing the pane doesn't
+ * subscribe it to every update. The live figures update through their Client.
  */
 const pane = {
   run: null as FenceRun | null,
   history: [] as FenceHistoryEntry[],
-  /** The setting whose dropdown holds the pane's focus ring. */
-  focus: null as string | null,
-  /** Whether the pane skipped a redraw while a setting had the focus. */
-  isStale: false,
-  /** The props of the last drawing, `isFocused` left out, and its `isFocused`. */
-  drawnProps: null as string | null,
-  wasFocused: false,
-  /** Drawings held back while a setting's dropdown is open, each waiting for `releasePane`. */
-  held: [] as (() => void)[],
   /** The pane's drawing in progress: each waits for the one before, so none answers out of turn. */
   drawing: Promise.resolve() as Promise<unknown>,
   /** Whether a surface without `Client` draws the pane: its live figures are plain text, so it redraws each step. */
   hasPlainSurface: false,
+  /** The run's changes in progress: each waits for the one before, so `run` above is always the last one written. */
+  changing: Promise.resolve() as Promise<unknown>,
 }
 
-/**
- * Runs one drawing of the pane after the one before it has answered. An answer
- * that lands after a newer one leaves the surface pressing the older drawing's
- * dropdowns, so a pick goes nowhere; and a request repeated while one is held
- * back waits behind it instead of drawing over an open dropdown.
- */
-function drawInTurn<T>(draw: () => Promise<T>): Promise<T> {
-  const drawn = pane.drawing.then(draw)
+// Desktop sometimes requests the focus redraw before it reports the focused
+// element. Replacing the Select while its menu is open resets the highlight.
+const desktop = {
+  props: null as string | null,
+  isFocused: false,
+  limit: null as string | null,
+  isChoosing: false,
+  focusRevision: 0,
+  wake: undefined as (() => void) | undefined,
+}
+
+async function waitForDesktopFocus($: EngineInterface, ms: number) {
+  let wake!: () => void
+  const changed = new Promise<void>(resolve => { wake = resolve })
+  desktop.wake = wake
+  try {
+    await Promise.race([changed, $.clock.sleep(ms)])
+  } finally {
+    if (desktop.wake === wake) desktop.wake = undefined
+  }
+}
+
+/** This load of the module: the live block keeps the newest view per load, so another session's never mixes in. */
+const LOAD = String(Math.random()).slice(2)
+
+/** Wait for the focus event, and keep render replies in request order. */
+function drawPaneInTurn<T>($: EngineInterface, e: RenderInput<'Pane'>, draw: () => Promise<T>): Promise<T> {
+  const isDesktop = e.surface === 'desktop'
+  const layout = isDesktop ? JSON.stringify({ ...e.props, isFocused: undefined }) : null
+  const sameLayout = isDesktop && layout === desktop.props
+  const gainedFocus = sameLayout && e.props.isFocused && !desktop.isFocused
+  if (isDesktop) {
+    desktop.props = layout
+    desktop.isFocused = e.props.isFocused
+    if (!e.props.isFocused) {
+      // A blur can arrive behind the redraw it needs to unblock.
+      desktop.focusRevision += 1
+      desktop.limit = null
+      desktop.isChoosing = false
+      desktop.wake?.()
+    }
+  }
+  const drawn = pane.drawing.then(async () => {
+    if (gainedFocus && desktop.isFocused && !desktop.isChoosing) await waitForDesktopFocus($, 200)
+    if (sameLayout && desktop.isFocused && desktop.isChoosing) await waitForDesktopFocus($, 30_000)
+    return draw()
+  })
   pane.drawing = drawn.catch(() => undefined)
   return drawn
-}
-
-/** Lets every held-back drawing answer. */
-function releasePane() {
-  for (const release of pane.held.splice(0)) release()
-}
-
-/** Redraws the pane for what changed, or leaves it for when the focus moves off a setting. */
-function refreshPane($: EngineInterface) {
-  if (pane.focus !== null) {
-    pane.isStale = true
-    return
-  }
-  pane.isStale = false
-  $.ui.invalidate('ui.render')
 }
 
 /** Saved limits, checked key by key and filled out with the defaults. */
@@ -138,44 +154,42 @@ async function calibration($: EngineInterface): Promise<FenceCalibration> {
 async function notePlan($: EngineInterface, readings: readonly Reading[]) {
   const plan = planOf(readings)
   if (!plan) return
-  // Written only on a change: each write redraws the pane, which resets an open dropdown.
+  // Written only on a change so stable plan details don't redraw the pane.
   const was = await read($, planAtom)
   if (was?.hasSession !== plan.hasSession || was?.hasWeekly !== plan.hasWeekly) await update($, planAtom, () => plan)
 }
 
 /**
- * What the pane lays out for a run, as opposed to the figures that move inside
- * it: a run starting, pausing, stopping or ending changes it; a step does not.
- */
-function layoutOf(run: FenceRun | null): string {
-  return run ? JSON.stringify([run.id, run.status, run.prompt, run.reason, run.five !== null, run.week !== null]) : ''
-}
-
-/**
  * `update` for the run, writing nothing when `fn` hands back the run it was given.
- * The pane's figures refresh themselves (`live.ts`), so the pane, and with it
- * every dropdown and button, is drawn again only when its layout changes.
+ * The prompt's section refreshes itself (`live.ts`), so the pane, and with it every
+ * dropdown and button, is drawn again only when a run first appears; a surface
+ * without `Client` draws the section as plain text and is drawn again each step.
  */
 async function changeRun($: EngineInterface, fn: (run: FenceRun | null) => FenceRun | null) {
-  const run = await read($, runAtom)
-  if (fn(run) === run) return
-  const before = layoutOf(pane.run)
-  pane.run = await update($, runAtom, fn)
-  if (pane.hasPlainSurface || layoutOf(pane.run) !== before) refreshPane($)
+  const changed = pane.changing.then(async () => {
+    const run = await read($, runAtom)
+    if (fn(run) === run) return
+    // The pane draws each figure's icon and name itself, so a figure appearing or going redraws it.
+    const before = figuresOf(pane.run).join()
+    pane.run = await update($, runAtom, fn)
+    if (pane.hasPlainSurface || figuresOf(pane.run).join() !== before) {
+      $.ui.invalidate('ui.render')
+    }
+  })
+  pane.changing = changed.catch(() => undefined)
+  return changed
 }
 
 /** Writes the history, for the pane to draw when it next can. */
 async function changeHistory($: EngineInterface, fn: (list: FenceHistoryEntry[]) => FenceHistoryEntry[]) {
   pane.history = await update($, historyAtom, list => fn(list ?? []))
-  refreshPane($)
+  $.ui.invalidate('ui.render')
   return pane.history
 }
 
-/**
- * A pick from a setting's dropdown: Custom… opens its field; any other value is
- * saved. A pick closes the dropdown, so a drawing held back for it answers.
- */
-async function pickLimit($: EngineInterface, key: Gauge, picked: string) {
+/** Custom… opens its field; any other pick saves the value and closes the editor. */
+async function pickLimit($: EngineInterface, key: Gauge, picked: string, isDesktop: boolean) {
+  const revision = desktop.focusRevision
   try {
     if (picked === CUSTOM) {
       await update($, editingAtom, () => ({ key, error: null }))
@@ -183,11 +197,14 @@ async function pickLimit($: EngineInterface, key: Gauge, picked: string) {
     }
     const value = Number(picked)
     if (!Number.isFinite(value) || value < 0) return
-    // Closes this setting's custom field, writing nothing when it was not open.
     if ((await read($, editingAtom))?.key === key) await update($, editingAtom, () => null)
     await saveLimit($, key, value)
   } finally {
-    releasePane()
+    // The render held behind the menu must see the new value (or custom field).
+    if (isDesktop && desktop.focusRevision === revision) {
+      desktop.isChoosing = false
+      desktop.wake?.()
+    }
   }
 }
 
@@ -291,10 +308,11 @@ export const register: Register = on => {
     })
     const history = await $.store.get(HISTORY_KEY)
     if (Array.isArray(history)) await update($, historyAtom, () => history as FenceHistoryEntry[])
+    // Debugging once kept a trace here; it is no longer written.
+    await $.store.delete('debug-trace').catch(() => undefined)
     // A reload starts the module over; the session's values outlive it.
     pane.run = await read($, runAtom)
     pane.history = await read($, historyAtom)
-    pane.focus = null
     const saved = savedLimits(await $.store.get(STORE_KEY))
     if (saved) await update($, limitsAtom, () => saved)
     await notePlan($, (await $.session.usage()).rateLimits)
@@ -620,54 +638,43 @@ export const register: Register = on => {
     )
   })
 
-  // Which setting's dropdown has the pane's focus, kept in memory: a write here
-  // would redraw the pane as the dropdown takes the focus.
   on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const previous = desktop.limit
+    const wasChoosing = desktop.isChoosing
+    const revision = ++desktop.focusRevision
+    const limit = e.element?.startsWith('limit-') ? e.element : null
+    // Capture the move before calling next: it can ask for another drawing.
+    desktop.limit = limit
+    desktop.isChoosing = limit !== null
+    if (limit === null ? previous !== null || e.element !== undefined : !wasChoosing) desktop.wake?.()
     const moved = await next(e)
-    if (moved.deny !== undefined) return moved
-    pane.focus = e.element?.startsWith('limit-') ? e.element : null
-    if (pane.focus === null) releasePane()
-    // Off the settings: draw what changed meanwhile.
-    if (pane.focus === null && pane.isStale) refreshPane($)
+    if (moved.deny !== undefined && desktop.focusRevision === revision) {
+      desktop.limit = previous
+      desktop.isChoosing = wasChoosing
+      if (!wasChoosing) desktop.wake?.()
+    }
     return moved
   }).catch(($, e, next) => next(e))
 
-  // A live figure asking for its latest value: answered with new props, the pane left as drawn.
+  // A block of the prompt section asking for its latest view. New props go out only when
+  // what it shows has changed, since the desktop can repaint the controls on a Client update;
+  // they go out whatever has the focus, so the numbers never stop moving.
   on('ui.message', async ($, e, next) => {
-    if (e.requestId !== PANE || !e.element.startsWith(LIVE_PREFIX)) return next(e)
-    const [limits, now] = await Promise.all([read($, limitsAtom), $.clock.now()])
-    return { props: liveText(e.element.slice(LIVE_PREFIX.length) as LiveId, pane.run, limits, now) }
+    const block = blockOf(e.element)
+    if (e.requestId !== PANE || block === null) return next(e)
+    const [run, limits, now] = await Promise.all([read($, runAtom), read($, limitsAtom), $.clock.now()])
+    if (!run) return {}
+    const view = promptView(run, limits, now, block.part, block.figure)
+    return e.data === promptContent(view) ? {} : { props: view }
   }).catch(($, e, next) => next(e))
 
   // The pane: what this prompt is spending, the settings, recent prompts.
-  on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawInTurn(async () => {
+  on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawPaneInTurn($, e, async () => {
     const table = $.ui.resolve(e)
     const { Box, Button, Input, Select, Text } = table
     const Client = 'Client' in table ? table.Client : undefined
     if (!Client) pane.hasPlainSurface = true
-    // A pane without the keyboard has no setting in focus, whatever the last move said:
-    // the live figures never stay frozen behind a focus that left without a word.
-    if (!e.props.isFocused) pane.focus = null
-    // The desktop asks for a drawing when the pane takes the focus, which a click on a
-    // setting's dropdown does, and only once the button is up: the drawing lands with the
-    // dropdown open, rebuilds it and puts its highlight back on its value under the
-    // pointer. Nothing drawn reads `isFocused`, so a drawing asked for that alone, with a
-    // dropdown in focus, waits for the pick or the focus to move on (or 30s at most).
-    // What was drawn is noted before any wait, so a later drawing is compared with itself.
-    const drawnProps = JSON.stringify({ ...e.props, isFocused: undefined })
-    const isFocusMoveAlone = drawnProps === pane.drawnProps && e.props.isFocused !== pane.wasFocused
-    pane.drawnProps = drawnProps
-    pane.wasFocused = e.props.isFocused
-    if (e.surface === 'desktop' && isFocusMoveAlone && pane.focus !== null) {
-      await Promise.race([new Promise<void>(release => pane.held.push(release)), $.clock.sleep(30_000)])
-    } else {
-      // A drawing for anything else stands in for one held back.
-      releasePane()
-    }
-    // The run and the history come from memory, not a read (see `pane`), and after any
-    // wait, so a held drawing shows the prompt as it stands.
     const { run, history } = pane
-    pane.isStale = false
     const [limits, plan, editing, isRecentOpen] = await Promise.all([
       read($, limitsAtom),
       read($, planAtom),
@@ -676,30 +683,9 @@ export const register: Register = on => {
     ])
     const now = await $.clock.now()
     const icon = iconFor($, e)
-    const isLive = run !== null && run.status !== 'done'
     const columns = e.props.bodyColumns ?? 60
 
     const setLimit = (key: keyof FenceLimits, value: FenceLimits[keyof FenceLimits]) => saveLimit($, key, value)
-
-    // A figure that moves while the prompt runs: a region that refreshes itself where the
-    // surface has them, so the pane is not drawn again for it; plain text elsewhere.
-    const live = (id: LiveId) => {
-      const t = liveText(id, run, limits, now)
-      if (Client) return <Client key={`${LIVE_PREFIX}${id}`} module="./live.ts" props={t} />
-      if (!t.text) return null
-      return (
-        <Text
-          key={`${LIVE_PREFIX}${id}`}
-          size={t.isFootnote ? 'footnote' : undefined}
-          weight={t.isMedium ? 'medium' : undefined}
-          tabular={t.isTabular || undefined}
-          wrap={t.isTruncated ? 'truncate-end' : undefined}
-          color={(t.color ?? undefined) as Level}
-        >
-          {t.text}
-        </Text>
-      )
-    }
 
     const heading = (text: string, trailing?: RenderChildren) => (
       <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap="md">
@@ -710,8 +696,7 @@ export const register: Register = on => {
       </Box>
     )
 
-    // One setting: its icon and name, the dropdown, and under the name what this prompt has used.
-    // "Custom…" opens a field under the row for any value the presets miss.
+    // Custom… opens a field under the row for values the presets don't cover.
     const row = (key: Gauge, glyph: IconName, name: string, choices: readonly number[]) => {
       const value = limits[key]
       const isEditing = editing?.key === key
@@ -733,13 +718,12 @@ export const register: Register = on => {
               <Text wrap="truncate-end" color={limits.isOn ? undefined : 'subtle'}>
                 {name}
               </Text>
-              {live(`hint-${key}`)}
             </Box>
             <Select
               key={`limit-${key}`}
               options={optionsFor(key, choices, value)}
               value={isEditing ? CUSTOM : String(value)}
-              onSelect={v => void pickLimit($, key, v)}
+              onSelect={(v, event) => void pickLimit($, key, v, event.surface === 'desktop')}
             />
           </Box>
           {isEditing ? (
@@ -776,44 +760,36 @@ export const register: Register = on => {
     const hasSession = plan?.hasSession ?? true
     const hasWeekly = plan?.hasWeekly ?? true
 
-    // A figure with its icon above its name: time, tokens, and the share of each window.
-    const stat = (glyph: IconName, name: string, id: LiveId) => (
-      <Box key={name} flexDirection="column" rowGap="xs" flexGrow={1} flexShrink={1} minWidth={10}>
-        <Box flexDirection="row" alignItems="center" columnGap="xs">
-          {icon(glyph, name)}
-          <Text size="footnote" color="subtle" wrap="truncate-end">
-            {name}
-          </Text>
+    // What this prompt is spending. The heading and each figure's number and pie are blocks
+    // that refresh themselves where the surface has them, so they move without the pane, its
+    // dropdowns and buttons, being drawn. For each figure the pane draws its icon and name,
+    // and its block sits under them.
+    const block = (part: PromptPart, figure: Figure | '' = '') => {
+      const view = promptView(run!, limits, now, part, figure)
+      return Client ? (
+        <Client key={`${LIVE_PREFIX}${part === 'head' ? 'head' : figure}`} module="./live.ts" props={view} width="100%" />
+      ) : (
+        drawPrompt({ Box, Text }, view)
+      )
+    }
+    const promptSection = !run ? null : (
+      <Box flexDirection="column" rowGap="sm">
+        {block('head')}
+        <Box key="figures" flexDirection="row" flexWrap="wrap" columnGap="lg" rowGap="sm">
+          {figuresOf(run).map(f => (
+            <Box key={f} flexDirection="column" rowGap="xs" flexGrow={1} flexShrink={1} minWidth={10}>
+              <Box flexDirection="row" alignItems="center" columnGap="xs">
+                {icon(FIGURE_ICONS[f], f)}
+                <Text size="footnote" color="subtle" wrap="truncate-end">
+                  {f}
+                </Text>
+              </Box>
+              {block('figure', f)}
+            </Box>
+          ))}
         </Box>
-        {live(id)}
       </Box>
     )
-
-    const promptSection = run ? (
-      <Box flexDirection="column" rowGap="sm">
-        {heading(
-          isLive ? 'This prompt' : 'Last prompt',
-          live('status'),
-        )}
-        {run.prompt ? (
-          <Text wrap="truncate-end" color="subtle">
-            {run.prompt}
-          </Text>
-        ) : null}
-        {run.status === 'paused' ? (
-          <Text size="footnote" color="warning">
-            {run.reason ?? 'A limit was reached'}. Waiting for your OK.
-          </Text>
-        ) : null}
-        <Box flexDirection="row" flexWrap="wrap" columnGap="lg" rowGap="sm">
-          {stat('clock', 'Time', 'time')}
-          {stat('tokens', 'Tokens', 'tokens')}
-          {run.five ? stat('session', 'Session', 'session') : null}
-          {run.week ? stat('weekly', 'Weekly', 'weekly') : null}
-        </Box>
-        {live('loops')}
-      </Box>
-    ) : null
 
     const recent = history.slice(0, 3)
 
@@ -916,62 +892,71 @@ export const register: Register = on => {
   })
 }
 
-/** The pane's figures that move while a prompt runs, each drawn by `live.ts`. */
-type LiveId = 'status' | 'time' | 'tokens' | 'session' | 'weekly' | 'loops' | `hint-${Gauge}`
+/** The `Client` keys of the prompt section's two blocks, and back. */
 const LIVE_PREFIX = 'live-'
 
-/** One live figure's text and look, for the run as it stands now. */
-function liveText(id: LiveId, run: FenceRun | null, limits: FenceLimits, now: number): LiveText {
-  const look = (text: string, color: string | null | undefined, style: Partial<Omit<LiveText, 'text' | 'color'>> = {}): LiveText => ({
-    text,
-    color: color ?? null,
-    isFootnote: false,
-    isMedium: false,
-    isTabular: false,
-    isTruncated: false,
-    ...style,
-  })
-  if (!run) return look('', null)
-  const level = (gauge: Gauge): Level => {
-    if (!limits.isOn) return undefined
-    const g = gaugeOf(run, limits, gauge, now)
-    return g ? levelOf(g.used, g.cap) : undefined
-  }
-  if (id.startsWith('hint-')) {
-    const gauge = id.slice('hint-'.length) as Gauge
-    const g = run.status !== 'done' && limits.isOn ? gaugeOf(run, limits, gauge, now) : null
-    if (!g || g.cap === 0) return look('', null)
-    const raised = g.cap > g.base ? ` · raised to ${shortAmount(gauge, g.cap)}` : ''
-    const used = g.share ? shareText(g.share) : shortAmount(gauge, g.used)
-    return look(`${used} of ${shortAmount(gauge, g.cap)} used${raised}`, levelOf(g.used, g.cap) ?? 'subtle', {
-      isFootnote: true,
-      isTabular: true,
-      isTruncated: true,
-    })
-  }
-  const figure = { isMedium: true, isTabular: true }
-  switch (id) {
-    case 'status':
-      return look(statusWord(run, now), STATUS_COLORS[run.status], { isFootnote: true, isMedium: true })
-    case 'time':
-      return look(duration(activeMs(run, now)), level('minutes'), figure)
-    case 'tokens':
-      return look(tokens(run.tokens), level('tokens'), figure)
-    case 'session':
-      return look(run.five ? shareText(shareOf(run, 'five')) : '', level('share'), figure)
-    case 'weekly':
-      return look(run.week ? shareText(shareOf(run, 'week')) : '', level('weeklyShare'), figure)
-    case 'loops': {
-      if (run.loops.length <= 1) return look('', null)
-      const n = run.loops.length - 1
-      const shares = [...run.loops]
-        .sort((x, y) => y.units - x.units)
-        .map(l => `${l.label} ~${pct(loopShare(run, l.id))}`)
-        .join(', ')
-      return look(`${n} ${n === 1 ? 'subagent' : 'subagents'} · ${shares}`, 'subtle', { isFootnote: true, isTruncated: true })
+/** Which block a `Client` key names: the head, or one figure. */
+function blockOf(key: string): { part: PromptPart; figure: Figure | '' } | null {
+  if (!key.startsWith(LIVE_PREFIX)) return null
+  const name = key.slice(LIVE_PREFIX.length)
+  if (name === 'head') return { part: 'head', figure: '' }
+  return name in FIGURE_ICONS ? { part: 'figure', figure: name as Figure } : null
+}
+
+/** The figures a run has, in order: time and tokens always, each usage window the plan has. */
+type Figure = 'Time' | 'Tokens' | 'Session' | 'Weekly'
+const FIGURE_ICONS: Record<Figure, IconName> = { Time: 'clock', Tokens: 'tokens', Session: 'session', Weekly: 'weekly' }
+function figuresOf(run: FenceRun | null): Figure[] {
+  if (!run) return []
+  return ['Time', 'Tokens', ...(run.five ? (['Session'] as const) : []), ...(run.week ? (['Weekly'] as const) : [])]
+}
+
+/** The pane's prompt section for the run as it stands now: status, figures against their limits, subagents. */
+function promptView(run: FenceRun, limits: FenceLimits, now: number, part: PromptPart, figure: Figure | '' = ''): PromptView {
+  const stat = (name: Figure, gauge: Gauge, used: string): PromptStat => {
+    const g = limits.isOn ? gaugeOf(run, limits, gauge, now) : null
+    const isCapped = g !== null && g.cap > 0 && run.status !== 'done'
+    const level = isCapped ? levelOf(g.used, g.cap) : undefined
+    // The pie takes the figure's own color, amber from 80% and red at the limit.
+    const hex = level === 'error' ? ERROR_HEX : level === 'warning' ? WARNING_HEX : ICON_COLORS[FIGURE_ICONS[name]]
+    return {
+      name,
+      used,
+      limit: isCapped ? shortAmount(gauge, g.cap) : '',
+      color: level ?? null,
+      pie: isCapped ? pieOf(g.used / g.cap) : '',
+      pieColor: isCapped ? hex : null,
     }
-    default:
-      return look('', null)
+  }
+  const stats = [
+    stat('Time', 'minutes', duration(activeMs(run, now))),
+    stat('Tokens', 'tokens', tokens(run.tokens)),
+    ...(run.five ? [stat('Session', 'share', shareText(shareOf(run, 'five')))] : []),
+    ...(run.week ? [stat('Weekly', 'weeklyShare', shareText(shareOf(run, 'week')))] : []),
+  ]
+  const subagents = run.loops.length - 1
+  const loops =
+    subagents > 0
+      ? `${subagents} ${subagents === 1 ? 'subagent' : 'subagents'} · ${[...run.loops]
+          .sort((x, y) => y.units - x.units)
+          .map(l => `${l.label} ~${pct(loopShare(run, l.id))}`)
+          .join(', ')}`
+      : ''
+  // Each block carries only what it draws, so a block is sent nothing new while only
+  // another's numbers move.
+  const isHead = part === 'head'
+  return {
+    part,
+    figure: isHead ? '' : figure,
+    load: LOAD,
+    at: now,
+    heading: !isHead ? '' : run.status === 'done' ? 'LAST PROMPT' : 'THIS PROMPT',
+    status: !isHead ? '' : run.isUnfenced && run.status === 'running' ? 'Running, no limits' : statusWord(run, now),
+    statusColor: isHead ? STATUS_COLORS[run.status] : '',
+    prompt: isHead ? run.prompt : '',
+    note: isHead && run.status === 'paused' ? `${run.reason ?? 'A limit was reached'}. Waiting for your OK.` : '',
+    stats: isHead ? [] : stats.filter(x => x.name === figure),
+    loops: isHead ? loops : '',
   }
 }
 
@@ -1045,15 +1030,6 @@ function ago(at: number, now: number): string {
   if (s < 3600) return `${Math.floor(s / 60)}m ago`
   if (s < 86_400) return `${Math.floor(s / 3600)}h ago`
   return `${Math.floor(s / 86_400)}d ago`
-}
-
-/** "3:00pm" for a reset today, "Mon 11:00am" for one later. */
-function resetLabel(iso: string | null, now: number): string | null {
-  const time = resetTime(iso)
-  if (!time || !iso) return null
-  const d = new Date(iso)
-  const isSoon = d.getTime() - now < 20 * 3_600_000
-  return isSoon ? time : `${d.toLocaleDateString([], { weekday: 'short' })} ${time}`
 }
 
 type Table = ReturnType<EngineInterface['ui']['resolve']>
