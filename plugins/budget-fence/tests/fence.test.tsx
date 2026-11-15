@@ -173,10 +173,9 @@ test('the band shows a gauge per limit while a prompt runs', async ($, on) => {
   } as never)
   expect((await ui.find({ type: 'Text', text: /\/ 10/ }))?.text).toBe('<1% / 10%')
   expect((await ui.find({ type: 'Button', key: 'details' }))?.props.label).toBe('⋯')
-  // The limit's icon is its meter: one ring icon, saying how full the limit is.
+  // The limit's full-size icon, then the lead's bar: Box sizes are cells, so the bar is an Svg.
   const svgs = await ui.findAll({ type: 'Svg' })
-  expect(svgs.map(x => [x.props.width, x.props.height, x.props.alt])).toEqual([[20, 20, 'Session, 0% of the limit']])
-  expect(await ui.find({ type: 'Text', text: /^[○◔◑◕●]$/ })).toBe(undefined)
+  expect(svgs.map(x => [x.props.width, x.props.height])).toEqual([[16, 16], [40, 4]])
   expect((await ui.findAll({ type: 'Box' })).every(x => x.props.width === undefined && x.props.height === undefined)).toBe(true)
   await ui.unmount()
 })
@@ -214,8 +213,8 @@ test('a weekly-only plan hides the session limit, and a pick changes the limit',
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Select', key: 'limit-share' })).toBe(undefined)
   expect((await ui.find({ type: 'Select', key: 'limit-weeklyShare' }))?.props.value).toBe('0')
-  await ui.select({ key: 'limit-minutes', value: '15' })
-  expect((await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value).toBe('15')
+  await ui.select({ key: 'limit-minutes', value: '30' })
+  expect((await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value).toBe('30')
   await ui.unmount()
 })
 
@@ -277,8 +276,8 @@ test('a finished prompt shows its spend, the plan bars, icons, and lands in the 
   // Each figure is its own column with a live block laid over it for the number and the fill.
   expect((await ui.findAll({ type: 'Client' })).map(x => x.key).sort()).toEqual(['live-Session', 'live-Time', 'live-Tokens', 'live-Weekly', 'live-head'])
   expect((await ui.find({ type: 'Text', text: /^0s$/, in: 'live-Time' }))?.text).toBe('0s')
-  // A finished prompt with no limit in force has no pie.
-  expect(await ui.find({ type: 'Text', text: /^[○◔◑◕●]$/, in: 'live-Time' })).toBe(undefined)
+  // A finished prompt with no limit in force has no ring.
+  expect((await ui.findAll({ type: 'Svg' })).map(x => x.props.alt)).toContain('Time')
   await ui.unmount()
 
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -289,7 +288,10 @@ test('a finished prompt shows its spend, the plan bars, icons, and lands in the 
   await $.turn.complete({ turnId: 't2', text: 'Fixed the flaky login test.', isAborted: false, reason: 'answer', answer: 'done' } as never)
   const hist = await $.ui.mount({ ...PANE, requestId: 'budget-fence-history', surface: 'desktop' })
   expect((await hist.find({ type: 'Text', text: /^Claude:/ }))?.text).toBe('Claude: Fixed the flaky login test.')
-  expect((await hist.find({ type: 'Text', text: /^2 prompts/ }))?.text).toContain('0 tokens')
+  // The totals read as labelled figures, and each row's details line never wraps.
+  const texts = (await hist.findAll({ type: 'Text' })).map(x => x.text)
+  expect(texts.slice(0, 6)).toEqual(['Prompts', '2', 'Time', '0s', 'Tokens', '0'])
+  expect(texts).toContain('now')
   await hist.unmount()
 })
 
@@ -380,7 +382,7 @@ test('recent prompts start collapsed and open on a press', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: 'tidy the README' })).toBe(undefined)
   await ui.press({ key: 'recent-toggle' })
   expect((await ui.find({ type: 'Text', text: 'tidy the README' }))?.text).toBe('tidy the README')
-  expect((await ui.find({ type: 'Text', text: /tokens/ }))?.text).toBe('1m · 1k tokens · ~0.3% of weekly')
+  expect((await ui.find({ type: 'Text', text: /tokens/ }))?.text).toBe('1m · 1k tokens')
   await ui.unmount()
 })
 
@@ -532,8 +534,8 @@ test('every band state reads "used / limit", with an icon on each status, on bot
     const svgs = surface === 'desktop' ? (await ui.findAll({ type: 'Svg' })).map(x => x.props.alt as string) : []
     const fig = texts.find(x => / \/ /.test(x))
     const word = texts.find(x => x === 'Paused' || x === 'Stopped')
-    const icons = svgs.filter(Boolean)
-    const dividers = surface === 'desktop' ? svgs.filter(x => x === '').length : texts.filter(x => x === '│').length
+    const icons = svgs.filter(x => x && x !== 'Divider')
+    const dividers = surface === 'desktop' ? svgs.filter(x => x === 'Divider').length : texts.filter(x => x === '│').length
     await ui.unmount()
     return { fig, word, icons, dividers }
   }
@@ -543,7 +545,7 @@ test('every band state reads "used / limit", with an icon on each status, on bot
     expect(await band(surface)).toEqual({
       fig: '2m / 10m',
       word: undefined,
-      icons: surface === 'desktop' ? ['Time, 20% of the limit', 'Tokens, 0% of the limit'] : [],
+      icons: surface === 'desktop' ? ['Time', '20% of the limit', 'Tokens'] : [],
       dividers: 1,
     })
   }
@@ -556,7 +558,7 @@ test('every band state reads "used / limit", with an icon on each status, on bot
     expect(await band(surface)).toEqual({
       fig: '11m / 10m',
       word: 'Paused',
-      icons: surface === 'desktop' ? ['Paused', 'Time, 100% of the limit'] : [],
+      icons: surface === 'desktop' ? ['Paused', 'Time', '100% of the limit'] : [],
       dividers: 1,
     })
   }
@@ -583,6 +585,8 @@ test('the prompt section keeps updating while a dropdown has focus, without draw
   }))
   on('session.measure', () => ({ changed: [] }))
   on('ui.focus', { plugin: '*' }, () => ({}) as never)
+  // A ring stepping asks for a drawing, which waits on the clock while a dropdown is open.
+  on('clock.sleep', () => ({ value: undefined }) as never)
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.turn.start({ text: 'go', turnId: 't1' })
@@ -614,13 +618,40 @@ test('the prompt section keeps updating while a dropdown has focus, without draw
   expect(await drawsOf(() => measure(44))).toBe(0)
   await ui.advance(1000)
   expect(await hint()).toBe('~4.0% / 10%')
-  // The session figure's pie shows its limit over a quarter used, in the figure's own color.
-  const pie = await ui.find({ type: 'Text', text: /^[○◔◑◕●]$/, in: 'live-Session' })
-  expect([pie?.text, pie?.props.color]).toEqual(['◔', '#2fa7a0'])
+  // The session figure's ring around its icon has stepped to 40%, in the figure's own color.
+  const ring = (await ui.findAll({ type: 'Svg' })).find(x => (x.props.alt as string).startsWith('Session,'))
+  expect(ring?.props.alt).toBe('Session, 40% of the limit')
+  expect(ring?.props.source as string).toContain('#2fa7a0')
   expect((await ui.find({ type: 'Select', key: 'limit-share' }))?.props.value).toBe('10')
   await ui.unmount()
 })
 
+
+test('a figure ring steps in tens: the pane is drawn again only when one crosses a step', async ($, on) => {
+  let t = 0
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true, minutes: 10 } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: t }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const ring = async () => (await ui.findAll({ type: 'Svg' })).map(x => x.props.alt as string).find(a => a.startsWith('Time,'))
+  expect(await ring()).toBe('Time, 0% of the limit')
+  // 50s of a 10m limit is still under the first step: no new drawing.
+  t = 50_000
+  await ui.advance(1000)
+  expect(await ring()).toBe('Time, 0% of the limit')
+  // 2m crosses into the 20% step: the pane is drawn again with the ring a fifth full.
+  t = 120_000
+  await ui.advance(1000)
+  expect(await ring()).toBe('Time, 20% of the limit')
+  await ui.unmount()
+})
 
 test('the prompt section never goes back to older numbers when the pane is drawn from an older view', async ($, on) => {
   let t = 0

@@ -41,7 +41,7 @@ import {
   parseLimitInput,
 } from './fence'
 import type { Gauge, Reading, Trip } from './fence'
-import { drawPrompt, pieOf, promptContent } from './live'
+import { drawPrompt, promptContent } from './live'
 import type { PromptPart, PromptStat, PromptView } from './live'
 
 const PANE = 'budget-fence'
@@ -72,6 +72,8 @@ const pane = {
   hasPlainSurface: false,
   /** The run's changes in progress: each waits for the one before, so `run` above is always the last one written. */
   changing: Promise.resolve() as Promise<unknown>,
+  /** The rings the pane last drew around its figures' icons, to redraw it only when one steps. */
+  rings: '',
 }
 
 // Desktop sometimes requests the focus redraw before it reports the focused
@@ -537,38 +539,38 @@ export const register: Register = on => {
     // Halted, paused or stopped, the whole row turns red, as the pane does.
     const leadLevel: Level = isHalted ? 'error' : levelOf(lead.g.used, lead.g.cap)
 
-    // One spacing scale for every state: an icon and its pie sit tight to what they
-    // label, and groups well apart.
+    // One spacing scale for every state: an icon and the lead's bar sit tight to what they
+    // label, and groups sit apart either side of a hairline (whose image is margin enough).
     const tight: Space = isTerminal ? 1 : 'xs'
-    const group: Space = isTerminal ? 2 : 'md'
+    const group: Space = isTerminal ? 2 : 'sm'
 
-    // Each limit's icon is its meter: a ring around the icon fills as the limit fills, in the
-    // limit's own color, amber from 80% and red at the limit (and red while halted). One element
-    // per limit, not an icon and a separate meter, so the icon and its figure read as one group.
-    // The terminal has no images: its glyph, then a pie in quarters.
-    const levelHex = (gauge: Gauge, ratio: number) => {
+    // The closest limit leads with a bar, so which one is nearest is plain at a glance, in its
+    // own color, amber from 80% and red at the limit (and red while halted). The terminal draws
+    // the bar in characters.
+    const bar = (gauge: Gauge, ratio: number) => {
+      const r = Math.min(1, Math.max(0, ratio))
       const level = isHalted ? leadLevel : levelOf(ratio, 1)
-      return level === 'error' ? ERROR_HEX : level === 'warning' ? WARNING_HEX : ICON_COLORS[BAND_ICONS[gauge]]
-    }
-    const meter = (gauge: Gauge, ratio: number) => {
-      const hex = levelHex(gauge, ratio)
+      const hex = level === 'error' ? ERROR_HEX : level === 'warning' ? WARNING_HEX : ICON_COLORS[BAND_ICONS[gauge]]
       if (!Svg) {
-        return [
-          icon(BAND_ICONS[gauge], GAUGE_NAMES[gauge]),
-          <Text key="pie" color={hex}>
-            {pieOf(ratio)}
-          </Text>,
-        ]
+        const filled = r > 0 ? Math.max(1, Math.round(r * BAR_CELLS)) : 0
+        return (
+          <Box key="bar" flexDirection="row">
+            <Text color={level ?? GLYPH_COLORS[BAND_ICONS[gauge]]}>{'━'.repeat(filled)}</Text>
+            <Text dimColor>{'━'.repeat(BAR_CELLS - filled)}</Text>
+          </Box>
+        )
       }
-      return [
+      // At least a short sliver once anything is used, so the bar never reads as empty.
+      const w = r > 0 ? Math.max(BAR_HEIGHT, Math.round(r * BAR_PX)) : 0
+      return (
         <Svg
-          key={`ring-${gauge}`}
-          alt={`${GAUGE_NAMES[gauge]}, ${Math.round(Math.min(1, ratio) * 100)}% of the limit`}
-          width={RING_PX}
-          height={RING_PX}
-          source={ringSvg(BAND_ICONS[gauge], ratio, hex)}
-        />,
-      ]
+          key="bar"
+          alt={`${Math.round(r * 100)}% of the limit`}
+          width={BAR_PX}
+          height={BAR_HEIGHT}
+          source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${BAR_PX} ${BAR_HEIGHT}"><rect width="${BAR_PX}" height="${BAR_HEIGHT}" rx="${BAR_HEIGHT / 2}" fill="${BAR_TRACK}"/>${w > 0 ? `<rect width="${w}" height="${BAR_HEIGHT}" rx="${BAR_HEIGHT / 2}" fill="${hex}"/>` : ''}</svg>`}
+        />
+      )
     }
 
     // Every state reads the same way, "used / limit", with the used part in the row's color.
@@ -584,15 +586,13 @@ export const register: Register = on => {
         {children}
       </Box>
     )
+    // Between groups, a hairline, as status bars divide their items. On a graphical surface
+    // it is an image the size of the icons with the line drawn in its middle, so the row
+    // centers it exactly as it centers the icons (text sits on the font's baseline, a little
+    // low, and a 1px-wide image did not show). The terminal draws a box-drawing line.
     const divider = (key: string) =>
       Svg ? (
-        <Svg
-          key={key}
-          alt=""
-          width={1}
-          height={DIVIDER_HEIGHT}
-          source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 ${DIVIDER_HEIGHT}"><rect width="1" height="${DIVIDER_HEIGHT}" fill="${DIVIDER}"/></svg>`}
-        />
+        <Svg key={key} alt="Divider" width={16} height={16} source={DIVIDER_SVG} />
       ) : (
         <Text key={key} dimColor>
           │
@@ -613,14 +613,14 @@ export const register: Register = on => {
     const room = Math.max(0, Math.floor((columns - 30) / 10))
     const others = isHalted ? [] : rest.slice(0, room)
 
-    // Each group is tight inside (its meter and its figure) and set apart from the next by a
-    // divider with a wide gap either side, so which figure belongs to which icon is plain.
+    // Each group is tight inside (its icon, the lead's bar, its figure) and set apart from the
+    // next by a divider with a wide gap either side, so which figure belongs to which icon is plain.
     const groups = [
       status,
-      pair('lead', [...meter(lead.gauge, lead.ratio), figure]),
+      pair('lead', [icon(BAND_ICONS[lead.gauge], GAUGE_NAMES[lead.gauge]), bar(lead.gauge, lead.ratio), figure]),
       ...others.map(o =>
         pair(o.gauge, [
-          ...meter(o.gauge, o.ratio),
+          icon(BAND_ICONS[o.gauge], GAUGE_NAMES[o.gauge]),
           <Text key="pct" size="footnote" tabular color={levelOf(o.g.used, o.g.cap) ?? 'subtle'}>
             {`${Math.min(999, Math.round(o.ratio * 100))}%`}
           </Text>,
@@ -663,6 +663,15 @@ export const register: Register = on => {
     if (e.requestId !== PANE || block === null) return next(e)
     const [run, limits, now] = await Promise.all([read($, runAtom), read($, limitsAtom), $.clock.now()])
     if (!run) return {}
+    // The rings around the figures' icons are the pane's own drawing, in 10% steps: the head's
+    // tick, once a second, redraws the pane when one has stepped, and at no other time.
+    if (block.part === 'head') {
+      const rings = ringsKey(run, limits, now)
+      if (rings !== pane.rings) {
+        pane.rings = rings
+        $.ui.invalidate('ui.render')
+      }
+    }
     const view = promptView(run, limits, now, block.part, block.figure)
     return e.data === promptContent(view) ? {} : { props: view }
   }).catch(($, e, next) => next(e))
@@ -672,6 +681,7 @@ export const register: Register = on => {
     const table = $.ui.resolve(e)
     const { Box, Button, Input, Select, Text } = table
     const Client = 'Client' in table ? table.Client : undefined
+    const Svg = e.surface !== 'terminal' && 'Svg' in table ? (table as Elements['desktop']).Svg : undefined
     if (!Client) pane.hasPlainSurface = true
     const { run, history } = pane
     const [limits, plan, editing, isRecentOpen] = await Promise.all([
@@ -683,6 +693,8 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const icon = iconFor($, e)
     const columns = e.props.bodyColumns ?? 60
+    // What this drawing's rings show, so the head's tick redraws only when one steps.
+    if (run) pane.rings = ringsKey(run, limits, now)
 
     const setLimit = (key: keyof FenceLimits, value: FenceLimits[keyof FenceLimits]) => saveLimit($, key, value)
 
@@ -759,14 +771,14 @@ export const register: Register = on => {
     const hasSession = plan?.hasSession ?? true
     const hasWeekly = plan?.hasWeekly ?? true
 
-    // What this prompt is spending. The heading and each figure's number and pie are blocks
+    // What this prompt is spending. The heading and each figure's number are blocks
     // that refresh themselves where the surface has them, so they move without the pane, its
     // dropdowns and buttons, being drawn. For each figure the pane draws its icon and name,
     // and its block sits under them.
     const block = (part: PromptPart, figure: Figure | '' = '') => {
       const view = promptView(run!, limits, now, part, figure)
       return Client ? (
-        <Client key={`${LIVE_PREFIX}${part === 'head' ? 'head' : figure}`} module="./live.ts" props={view} width="100%" />
+        <Client key={`${LIVE_PREFIX}${part === 'head' ? 'head' : figure}`} module="./live.ts" props={view} width={part === 'head' ? '100%' : undefined} />
       ) : (
         drawPrompt({ Box, Text }, view)
       )
@@ -783,7 +795,13 @@ export const register: Register = on => {
                   {f}
                 </Text>
               </Box>
-              {block('figure', f)}
+              {/* The number, then a ring of how full its limit is; no ring with no limit. */}
+              <Box key="value" flexDirection="row" alignItems="center" columnGap="xs">
+                {block('figure', f)}
+                {Svg && ringOf(run, limits, now, f).step !== null ? (
+                  <Svg key={`ring-${f}`} alt={ringAlt(f, ringOf(run, limits, now, f))} width={RING_PX} height={RING_PX} source={ringSvg(ringOf(run, limits, now, f))} />
+                ) : null}
+              </Box>
             </Box>
           ))}
         </Box>
@@ -865,11 +883,23 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" rowGap="lg">
-        <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap="md">
-          <Text size="footnote" color="subtle" tabular wrap="truncate-end">
-            {history.length} prompts · {duration(totals.ms)} · {tokens(totals.tokens)} tokens
-            {totals.weekly > 0 ? ` · ~${pct(totals.weekly)} of weekly limit` : ''}
-          </Text>
+        <Box flexDirection="row" alignItems="flex-end" columnGap="lg">
+          {[
+            ['Prompts', String(history.length)],
+            ['Time', duration(totals.ms)],
+            ['Tokens', tokens(totals.tokens)],
+            ...(totals.weekly > 0 ? [['Weekly', `~${pct(totals.weekly)}`]] : []),
+          ].map(([name, value]) => (
+            <Box key={name} flexDirection="column">
+              <Text size="footnote" color="subtle">
+                {name}
+              </Text>
+              <Text weight="medium" tabular>
+                {value}
+              </Text>
+            </Box>
+          ))}
+          <Box key="spacer" flexGrow={1} />
           <Button
             key="clear-history"
             plain
@@ -910,22 +940,59 @@ function figuresOf(run: FenceRun | null): Figure[] {
   return ['Time', 'Tokens', ...(run.five ? (['Session'] as const) : []), ...(run.week ? (['Weekly'] as const) : [])]
 }
 
+const FIGURE_GAUGES: Record<Figure, Gauge> = { Time: 'minutes', Tokens: 'tokens', Session: 'share', Weekly: 'weeklyShare' }
+
+/**
+ * A figure's ring: how full its limit is in 10% steps, and its color (the figure's own,
+ * amber from 80%, red at the limit or while the prompt is halted); no step with no limit.
+ */
+type Ring = { step: number | null; color: string }
+function ringOf(run: FenceRun, limits: FenceLimits, now: number, f: Figure): Ring {
+  const color = ICON_COLORS[FIGURE_ICONS[f]]
+  const g = limits.isOn && run.status !== 'done' ? gaugeOf(run, limits, FIGURE_GAUGES[f], now) : null
+  if (!g || g.cap <= 0) return { step: null, color }
+  const isHalted = run.status === 'paused' || run.status === 'denied'
+  const level = isHalted ? 'error' : levelOf(g.used, g.cap)
+  return {
+    step: Math.floor(Math.min(1, g.used / g.cap) * 10) / 10,
+    color: level === 'error' ? ERROR_HEX : level === 'warning' ? WARNING_HEX : color,
+  }
+}
+
+/** Every figure's ring, to compare what the pane drew with what it would draw now. */
+function ringsKey(run: FenceRun, limits: FenceLimits, now: number): string {
+  return JSON.stringify(figuresOf(run).map(f => ringOf(run, limits, now, f)))
+}
+
+function ringAlt(f: Figure, ring: Ring): string {
+  return ring.step === null ? f : `${f}, ${Math.round(ring.step * 100)}% of the limit`
+}
+
+/** A figure's ring beside its number: an empty ring that fills clockwise from the top. */
+const RING_PX = 14
+const RING_TRACK = 'rgba(139, 145, 156, 0.35)'
+function ringSvg(ring: Ring): string {
+  const r = 9
+  const length = 2 * Math.PI * r
+  const filled = (ring.step ?? 0) * length
+  const arc =
+    filled > 0
+      ? `<circle cx="12" cy="12" r="${r}" stroke="${ring.color}" stroke-width="3.5" stroke-dasharray="${filled.toFixed(2)} ${length.toFixed(2)}" transform="rotate(-90 12 12)"/>`
+      : ''
+  return (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="butt">' +
+    `<circle cx="12" cy="12" r="${r}" stroke="${RING_TRACK}" stroke-width="3.5"/>${arc}` +
+    '</svg>'
+  )
+}
+
 /** The pane's prompt section for the run as it stands now: status, figures against their limits, subagents. */
 function promptView(run: FenceRun, limits: FenceLimits, now: number, part: PromptPart, figure: Figure | '' = ''): PromptView {
   const stat = (name: Figure, gauge: Gauge, used: string): PromptStat => {
     const g = limits.isOn ? gaugeOf(run, limits, gauge, now) : null
     const isCapped = g !== null && g.cap > 0 && run.status !== 'done'
     const level = isCapped ? levelOf(g.used, g.cap) : undefined
-    // The pie takes the figure's own color, amber from 80% and red at the limit.
-    const hex = level === 'error' ? ERROR_HEX : level === 'warning' ? WARNING_HEX : ICON_COLORS[FIGURE_ICONS[name]]
-    return {
-      name,
-      used,
-      limit: isCapped ? shortAmount(gauge, g.cap) : '',
-      color: level ?? null,
-      pie: isCapped ? pieOf(g.used / g.cap) : '',
-      pieColor: isCapped ? hex : null,
-    }
+    return { name, used, limit: isCapped ? shortAmount(gauge, g.cap) : '', color: level ?? null }
   }
   const stats = [
     stat('Time', 'minutes', duration(activeMs(run, now))),
@@ -968,10 +1035,10 @@ function levelOf(used: number, cap: number): Level {
 
 const CUSTOM = 'custom'
 
-const MINUTES = [0, 5, 10, 15, 30, 60, 120]
+const MINUTES = [0, 1, 5, 30, 60, 120, 300]
 const TOKENS = [0, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000]
 const SESSION = [0, 2, 5, 10, 15, 20, 30]
-const WEEKLY = [0, 0.5, 1, 2, 5, 10]
+const WEEKLY = [0, 1, 2, 5, 10, 25, 50]
 
 const PLACEHOLDERS: Record<Gauge, string> = {
   minutes: 'Minutes, e.g. 45 or 1h 30m',
@@ -1023,13 +1090,17 @@ function statusWord(run: FenceRun, now: number): string {
   }
 }
 
+/** How long ago, in one short form for every row: "now", "2m ago", "4h ago", "3d ago". */
 function ago(at: number, now: number): string {
   const s = Math.max(0, Math.round((now - at) / 1000))
-  if (s < 60) return 'just now'
+  if (s < 60) return 'now'
   if (s < 3600) return `${Math.floor(s / 60)}m ago`
   if (s < 86_400) return `${Math.floor(s / 3600)}h ago`
   return `${Math.floor(s / 86_400)}d ago`
 }
+
+/** The time column's width, in cells: room for "59m ago" without wrapping. */
+const AGO_CELLS = 7
 
 type Table = ReturnType<EngineInterface['ui']['resolve']>
 
@@ -1038,27 +1109,40 @@ function savedShare(value: number, isExact: boolean | undefined): string {
   return shareText({ value, isExact: isExact === true, isEstimate: !Number.isInteger(value) })
 }
 
-function historyRow(Box: Table['Box'], Text: Table['Text'], entry: FenceHistoryEntry, now: number, columns: number) {
-  const parts = [
+/**
+ * One finished prompt: its title on one line, cut off at the edge, with when it finished in a
+ * fixed column on the right; under it, what it spent and anything unusual. Nothing wraps.
+ */
+function historyRow(Box: Table['Box'], Text: Table['Text'], entry: FenceHistoryEntry, now: number, _columns: number) {
+  // Shares under 1% say nothing on nearly every row, so only a real share is listed.
+  const share = (value: number | null, isExact: boolean | undefined, name: string) =>
+    value !== null && value >= 1 ? `${savedShare(value, isExact)} of ${name} limit` : null
+  const spent = [
     duration(entry.activeMs),
     `${tokens(entry.tokens)} tokens`,
-    entry.sessionPct !== null ? `${savedShare(entry.sessionPct, entry.sessionIsExact)} of session` : null,
-    entry.weeklyPct !== null ? `${savedShare(entry.weeklyPct, entry.weeklyIsExact)} of weekly` : null,
-    entry.agents > 0 ? `${entry.agents} ${entry.agents === 1 ? 'agent' : 'agents'}` : null,
-    entry.pauses > 0 ? `paused ${entry.pauses}×` : null,
+    share(entry.sessionPct, entry.sessionIsExact, 'session'),
+    share(entry.weeklyPct, entry.weeklyIsExact, 'weekly'),
+    entry.agents > 0 ? `${entry.agents} ${entry.agents === 1 ? 'subagent' : 'subagents'}` : null,
   ].filter(Boolean)
+  // What went differently, in red: a prompt the fence stopped, or one it paused.
+  const flag = entry.wasStopped ? 'Stopped' : entry.pauses > 0 ? `Paused ${entry.pauses}×` : null
   return (
-    <Box key={entry.id} flexDirection="column">
-      <Box flexDirection="row" columnGap="md">
-        <Box flexGrow={1} flexShrink={1}>
-          <Text wrap="truncate-end" color={entry.prompt ? undefined : 'subtle'}>{titleOf(entry)}</Text>
+    <Box key={entry.id} flexDirection="column" rowGap="xs">
+      <Box flexDirection="row" alignItems="center" columnGap="md">
+        <Box flexGrow={1} flexShrink={1} width={0} minWidth={0}>
+          <Text wrap="truncate-end" color={entry.prompt ? undefined : 'subtle'}>
+            {titleOf(entry)}
+          </Text>
         </Box>
-        <Text size="footnote" color="subtle">
-          {ago(entry.startedAt + entry.activeMs, now)}
-        </Text>
+        <Box flexShrink={0} minWidth={AGO_CELLS} justifyContent="flex-end">
+          <Text size="footnote" color="subtle" tabular wrap="truncate-end">
+            {ago(entry.startedAt + entry.activeMs, now)}
+          </Text>
+        </Box>
       </Box>
-      <Text size="footnote" tabular color="subtle" wrap={columns < 50 ? 'truncate-end' : undefined}>
-        {parts.join(' · ')}
+      <Text size="footnote" tabular color="subtle" wrap="truncate-end">
+        {spent.join(' · ')}
+        {flag ? <Text color="error">{`  ${flag}`}</Text> : null}
       </Text>
     </Box>
   )
@@ -1108,31 +1192,21 @@ const BAND_ICONS: Record<Gauge, IconName> = { minutes: 'clock', tokens: 'tokens'
 const GAUGE_NAMES: Record<Gauge, string> = { minutes: 'Time', tokens: 'Tokens', share: 'Session', weeklyShare: 'Weekly' }
 /** How much closer another limit must be before it takes the lead. */
 const LEAD_MARGIN = 0.05
-/** A 1px divider, dark enough to show on a dark backdrop. */
-const DIVIDER = 'rgba(139, 145, 156, 0.45)'
-const DIVIDER_HEIGHT = 12
 const WARNING_HEX = '#e0a32f'
 const ERROR_HEX = '#e0524f'
-/** The band's ring icons: a little larger than a plain icon, for the ring around it. */
-const RING_PX = 20
-const RING_TRACK = 'rgba(139, 145, 156, 0.3)'
+/**
+ * The band's divider: a line 2 wide and 12 high, on whole pixels, in the middle of an
+ * icon-sized image, in the bar's track gray made a little stronger. Like every image the
+ * band draws, it has alt text: the two that had none, and a hairline on a half pixel, never showed.
+ */
+const DIVIDER_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="7" y="2" width="2" height="12" rx="1" fill="rgba(139, 145, 156, 0.6)"/></svg>'
 
-/** An icon inside a ring that fills clockwise from the top as its limit fills. */
-function ringSvg(name: IconName, ratio: number, color: string): string {
-  const r = 10.5
-  const length = 2 * Math.PI * r
-  const filled = Math.min(1, Math.max(0, ratio)) * length
-  const arc =
-    filled > 0
-      ? `<circle cx="12" cy="12" r="${r}" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-dasharray="${filled.toFixed(2)} ${length.toFixed(2)}" transform="rotate(-90 12 12)"/>`
-      : ''
-  return (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">' +
-    `<circle cx="12" cy="12" r="${r}" stroke="${RING_TRACK}" stroke-width="2"/>${arc}` +
-    `<g transform="translate(12 12) scale(0.5) translate(-12 -12)" stroke="${ICON_COLORS[name]}" stroke-width="2.6">${ICON_PATHS[name]}</g>` +
-    '</svg>'
-  )
-}
+/** The lead's bar: short enough that a little use doesn't read as a long empty track. */
+const BAR_PX = 40
+const BAR_HEIGHT = 4
+const BAR_CELLS = 8
+const BAR_TRACK = 'rgba(139, 145, 156, 0.3)'
 
 /**
  * The usage gauge, shrunk to the top-left, with the window's length set in the

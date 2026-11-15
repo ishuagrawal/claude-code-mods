@@ -2,22 +2,10 @@ import type { ClientElements, ClientModule, RenderElement } from 'claude-code'
 
 /**
  * One figure of the prompt: what it measures, how much is used, its limit ('' for
- * none) and the number's color; and how full its limit is as a pie glyph ('' with
- * no limit) in the pie's own color.
+ * none) and the number's color. How full its limit is shows as a ring the pane
+ * draws around the figure's icon.
  */
-export type PromptStat = {
-  name: string
-  used: string
-  limit: string
-  color: string | null
-  pie: string
-  pieColor: string | null
-}
-
-/** How full a limit is as a pie, in quarters: empty, ¼, ½, ¾, full. */
-export function pieOf(ratio: number): string {
-  return ratio >= 1 ? '●' : ratio >= 0.75 ? '◕' : ratio >= 0.5 ? '◑' : ratio >= 0.25 ? '◔' : '○'
-}
+export type PromptStat = { name: string; used: string; limit: string; color: string | null }
 
 /**
  * One live block of the pane's prompt section, as the hooks module works it out.
@@ -28,8 +16,8 @@ export function pieOf(ratio: number): string {
 export type PromptView = {
   /**
    * `head`: the heading, status, prompt, pause note and subagents. `figure`: one
-   * figure's number and pie, under the icon and name the pane draws for it (icons
-   * are images a block cannot draw).
+   * figure's number, under the icon and name the pane draws for it and beside its
+   * ring (images a block cannot draw).
    */
   part: PromptPart
   /** The figure a `figure` block shows; '' for the head. */
@@ -51,7 +39,7 @@ export type PromptPart = 'head' | 'figure'
 export function promptContent(view: PromptView): string {
   return JSON.stringify([
     view.part, view.figure, view.load, view.heading, view.status, view.statusColor, view.prompt, view.note, view.loops,
-    view.stats.map(s => [s.name, s.used, s.limit, s.color, s.pie, s.pieColor]),
+    view.stats.map(s => [s.name, s.used, s.limit, s.color]),
   ])
 }
 
@@ -83,11 +71,9 @@ export function drawPrompt({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, 
       ],
     })
   }
-  // A figure's number, and beside it a pie of how full its limit is, under the icon and name
-  // the pane draws for it.
+  // A figure's number, as wide as it draws, so the ring the pane draws beside it follows it.
   const s = view.stats[0]
   return Box({
-    width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     columnGap: 'xs',
@@ -103,7 +89,6 @@ export function drawPrompt({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, 
             ],
           })
         : null,
-      s?.pie ? Text({ ...color(s.pieColor), children: s.pie }) : null,
     ],
   })
 }
