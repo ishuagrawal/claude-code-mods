@@ -41,6 +41,7 @@ import {
   parseLimitInput,
 } from './fence'
 import type { Gauge, Reading, Trip } from './fence'
+import type { LiveText } from './live'
 
 const PANE = 'budget-fence'
 const TITLE = 'Budget fence'
@@ -77,6 +78,8 @@ const pane = {
   held: [] as (() => void)[],
   /** The pane's drawing in progress: each waits for the one before, so none answers out of turn. */
   drawing: Promise.resolve() as Promise<unknown>,
+  /** Whether a surface without `Client` draws the pane: its live figures are plain text, so it redraws each step. */
+  hasPlainSurface: false,
 }
 
 /**
@@ -140,12 +143,25 @@ async function notePlan($: EngineInterface, readings: readonly Reading[]) {
   if (was?.hasSession !== plan.hasSession || was?.hasWeekly !== plan.hasWeekly) await update($, planAtom, () => plan)
 }
 
-/** `update` for the run, writing nothing when `fn` hands back the run it was given. */
+/**
+ * What the pane lays out for a run, as opposed to the figures that move inside
+ * it: a run starting, pausing, stopping or ending changes it; a step does not.
+ */
+function layoutOf(run: FenceRun | null): string {
+  return run ? JSON.stringify([run.id, run.status, run.prompt, run.reason, run.five !== null, run.week !== null]) : ''
+}
+
+/**
+ * `update` for the run, writing nothing when `fn` hands back the run it was given.
+ * The pane's figures refresh themselves (`live.ts`), so the pane, and with it
+ * every dropdown and button, is drawn again only when its layout changes.
+ */
 async function changeRun($: EngineInterface, fn: (run: FenceRun | null) => FenceRun | null) {
   const run = await read($, runAtom)
   if (fn(run) === run) return
+  const before = layoutOf(pane.run)
   pane.run = await update($, runAtom, fn)
-  refreshPane($)
+  if (pane.hasPlainSurface || layoutOf(pane.run) !== before) refreshPane($)
 }
 
 /** Writes the history, for the pane to draw when it next can. */
@@ -616,9 +632,19 @@ export const register: Register = on => {
     return moved
   }).catch(($, e, next) => next(e))
 
+  // A live figure asking for its latest value: answered with new props, the pane left as drawn.
+  on('ui.message', async ($, e, next) => {
+    if (e.requestId !== PANE || !e.element.startsWith(LIVE_PREFIX)) return next(e)
+    const [limits, now] = await Promise.all([read($, limitsAtom), $.clock.now()])
+    return { props: liveText(e.element.slice(LIVE_PREFIX.length) as LiveId, pane.run, limits, now) }
+  }).catch(($, e, next) => next(e))
+
   // The pane: what this prompt is spending, the settings, recent prompts.
   on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawInTurn(async () => {
-    const { Box, Button, Input, Select, Text } = $.ui.resolve(e)
+    const table = $.ui.resolve(e)
+    const { Box, Button, Input, Select, Text } = table
+    const Client = 'Client' in table ? table.Client : undefined
+    if (!Client) pane.hasPlainSurface = true
     // A pane without the keyboard has no setting in focus, whatever the last move said:
     // the live figures never stay frozen behind a focus that left without a word.
     if (!e.props.isFocused) pane.focus = null
@@ -655,6 +681,26 @@ export const register: Register = on => {
 
     const setLimit = (key: keyof FenceLimits, value: FenceLimits[keyof FenceLimits]) => saveLimit($, key, value)
 
+    // A figure that moves while the prompt runs: a region that refreshes itself where the
+    // surface has them, so the pane is not drawn again for it; plain text elsewhere.
+    const live = (id: LiveId) => {
+      const t = liveText(id, run, limits, now)
+      if (Client) return <Client key={`${LIVE_PREFIX}${id}`} module="./live.ts" props={t} />
+      if (!t.text) return null
+      return (
+        <Text
+          key={`${LIVE_PREFIX}${id}`}
+          size={t.isFootnote ? 'footnote' : undefined}
+          weight={t.isMedium ? 'medium' : undefined}
+          tabular={t.isTabular || undefined}
+          wrap={t.isTruncated ? 'truncate-end' : undefined}
+          color={(t.color ?? undefined) as Level}
+        >
+          {t.text}
+        </Text>
+      )
+    }
+
     const heading = (text: string, trailing?: RenderChildren) => (
       <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap="md">
         <Text size="footnote" weight="medium" color="subtle">
@@ -666,7 +712,7 @@ export const register: Register = on => {
 
     // One setting: its icon and name, the dropdown, and under the name what this prompt has used.
     // "Custom…" opens a field under the row for any value the presets miss.
-    const row = (key: Gauge, glyph: IconName, name: string, choices: readonly number[], hint: Hint | null) => {
+    const row = (key: Gauge, glyph: IconName, name: string, choices: readonly number[]) => {
       const value = limits[key]
       const isEditing = editing?.key === key
       const submit = (text: string) =>
@@ -687,11 +733,7 @@ export const register: Register = on => {
               <Text wrap="truncate-end" color={limits.isOn ? undefined : 'subtle'}>
                 {name}
               </Text>
-              {hint ? (
-                <Text size="footnote" tabular wrap="truncate-end" color={hint.color ?? 'subtle'}>
-                  {hint.text}
-                </Text>
-              ) : null}
+              {live(`hint-${key}`)}
             </Box>
             <Select
               key={`limit-${key}`}
@@ -730,21 +772,12 @@ export const register: Register = on => {
       )
     }
 
-    const gaugeHint = (gauge: Gauge): Hint | null => {
-      if (!isLive || !limits.isOn) return null
-      const g = gaugeOf(run, limits, gauge, now)
-      if (!g || g.cap === 0) return null
-      const raised = g.cap > g.base ? ` · raised to ${shortAmount(gauge, g.cap)}` : ''
-      const used = g.share ? shareText(g.share) : shortAmount(gauge, g.used)
-      return { text: `${used} of ${shortAmount(gauge, g.cap)} used${raised}`, color: levelOf(g.used, g.cap) }
-    }
-
     // Ultra plans have no 5-hour session window; offer only the windows the plan has.
     const hasSession = plan?.hasSession ?? true
     const hasWeekly = plan?.hasWeekly ?? true
 
     // A figure with its icon above its name: time, tokens, and the share of each window.
-    const stat = (glyph: IconName, name: string, value: string, level: Level) => (
+    const stat = (glyph: IconName, name: string, id: LiveId) => (
       <Box key={name} flexDirection="column" rowGap="xs" flexGrow={1} flexShrink={1} minWidth={10}>
         <Box flexDirection="row" alignItems="center" columnGap="xs">
           {icon(glyph, name)}
@@ -752,25 +785,15 @@ export const register: Register = on => {
             {name}
           </Text>
         </Box>
-        <Text weight="medium" tabular color={level}>
-          {value}
-        </Text>
+        {live(id)}
       </Box>
     )
-
-    const near = (gauge: Gauge): Level => {
-      if (!run || !limits.isOn) return undefined
-      const g = gaugeOf(run, limits, gauge, now)
-      return g ? levelOf(g.used, g.cap) : undefined
-    }
 
     const promptSection = run ? (
       <Box flexDirection="column" rowGap="sm">
         {heading(
           isLive ? 'This prompt' : 'Last prompt',
-          <Text size="footnote" weight="medium" color={STATUS_COLORS[run.status]}>
-            {statusWord(run, now)}
-          </Text>,
+          live('status'),
         )}
         {run.prompt ? (
           <Text wrap="truncate-end" color="subtle">
@@ -783,20 +806,12 @@ export const register: Register = on => {
           </Text>
         ) : null}
         <Box flexDirection="row" flexWrap="wrap" columnGap="lg" rowGap="sm">
-          {stat('clock', 'Time', duration(activeMs(run, now)), near('minutes'))}
-          {stat('tokens', 'Tokens', tokens(run.tokens), near('tokens'))}
-          {run.five ? stat('session', 'Session', shareText(shareOf(run, 'five')), near('share')) : null}
-          {run.week ? stat('weekly', 'Weekly', shareText(shareOf(run, 'week')), near('weeklyShare')) : null}
+          {stat('clock', 'Time', 'time')}
+          {stat('tokens', 'Tokens', 'tokens')}
+          {run.five ? stat('session', 'Session', 'session') : null}
+          {run.week ? stat('weekly', 'Weekly', 'weekly') : null}
         </Box>
-        {run.loops.length > 1 ? (
-          <Text size="footnote" color="subtle" wrap="truncate-end">
-            {run.loops.length - 1} {run.loops.length === 2 ? 'subagent' : 'subagents'} ·{' '}
-            {[...run.loops]
-              .sort((x, y) => y.units - x.units)
-              .map(l => `${l.label} ~${pct(loopShare(run, l.id))}`)
-              .join(', ')}
-          </Text>
-        ) : null}
+        {live('loops')}
       </Box>
     ) : null
 
@@ -826,10 +841,10 @@ export const register: Register = on => {
 
         <Box flexDirection="column" rowGap="sm">
           {heading('Pause a prompt after')}
-          {row('minutes', 'clock', 'Working time', MINUTES, gaugeHint('minutes'))}
-          {row('tokens', 'tokens', 'Tokens', TOKENS, gaugeHint('tokens'))}
-          {hasSession ? row('share', 'session', 'Share of session limit', SESSION, gaugeHint('share')) : null}
-          {hasWeekly ? row('weeklyShare', 'weekly', 'Share of weekly limit', WEEKLY, gaugeHint('weeklyShare')) : null}
+          {row('minutes', 'clock', 'Working time', MINUTES)}
+          {row('tokens', 'tokens', 'Tokens', TOKENS)}
+          {hasSession ? row('share', 'session', 'Share of session limit', SESSION) : null}
+          {hasWeekly ? row('weeklyShare', 'weekly', 'Share of weekly limit', WEEKLY) : null}
         </Box>
 
         {recent.length > 0 ? (
@@ -901,7 +916,64 @@ export const register: Register = on => {
   })
 }
 
-type Hint = { text: string; color: Level }
+/** The pane's figures that move while a prompt runs, each drawn by `live.ts`. */
+type LiveId = 'status' | 'time' | 'tokens' | 'session' | 'weekly' | 'loops' | `hint-${Gauge}`
+const LIVE_PREFIX = 'live-'
+
+/** One live figure's text and look, for the run as it stands now. */
+function liveText(id: LiveId, run: FenceRun | null, limits: FenceLimits, now: number): LiveText {
+  const look = (text: string, color: string | null | undefined, style: Partial<Omit<LiveText, 'text' | 'color'>> = {}): LiveText => ({
+    text,
+    color: color ?? null,
+    isFootnote: false,
+    isMedium: false,
+    isTabular: false,
+    isTruncated: false,
+    ...style,
+  })
+  if (!run) return look('', null)
+  const level = (gauge: Gauge): Level => {
+    if (!limits.isOn) return undefined
+    const g = gaugeOf(run, limits, gauge, now)
+    return g ? levelOf(g.used, g.cap) : undefined
+  }
+  if (id.startsWith('hint-')) {
+    const gauge = id.slice('hint-'.length) as Gauge
+    const g = run.status !== 'done' && limits.isOn ? gaugeOf(run, limits, gauge, now) : null
+    if (!g || g.cap === 0) return look('', null)
+    const raised = g.cap > g.base ? ` · raised to ${shortAmount(gauge, g.cap)}` : ''
+    const used = g.share ? shareText(g.share) : shortAmount(gauge, g.used)
+    return look(`${used} of ${shortAmount(gauge, g.cap)} used${raised}`, levelOf(g.used, g.cap) ?? 'subtle', {
+      isFootnote: true,
+      isTabular: true,
+      isTruncated: true,
+    })
+  }
+  const figure = { isMedium: true, isTabular: true }
+  switch (id) {
+    case 'status':
+      return look(statusWord(run, now), STATUS_COLORS[run.status], { isFootnote: true, isMedium: true })
+    case 'time':
+      return look(duration(activeMs(run, now)), level('minutes'), figure)
+    case 'tokens':
+      return look(tokens(run.tokens), level('tokens'), figure)
+    case 'session':
+      return look(run.five ? shareText(shareOf(run, 'five')) : '', level('share'), figure)
+    case 'weekly':
+      return look(run.week ? shareText(shareOf(run, 'week')) : '', level('weeklyShare'), figure)
+    case 'loops': {
+      if (run.loops.length <= 1) return look('', null)
+      const n = run.loops.length - 1
+      const shares = [...run.loops]
+        .sort((x, y) => y.units - x.units)
+        .map(l => `${l.label} ~${pct(loopShare(run, l.id))}`)
+        .join(', ')
+      return look(`${n} ${n === 1 ? 'subagent' : 'subagents'} · ${shares}`, 'subtle', { isFootnote: true, isTruncated: true })
+    }
+    default:
+      return look('', null)
+  }
+}
 
 /** How close a figure is to its limit, as a color: plain, amber from 80%, red at the limit. */
 type Level = 'warning' | 'error' | undefined

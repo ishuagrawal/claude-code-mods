@@ -484,9 +484,11 @@ test('a finished prompt keeps its numbers when usage moves later', async ($, on)
   await $.turn.complete({ turnId: 't1', reason: 'answer', answer: '', durationMs: 0, isAborted: false })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const before = (await ui.find({ type: 'Text', text: /%/ }))?.text
+  const session = async () => (await ui.find({ type: 'Text', in: 'live-session' }))?.text
+  const before = await session()
   await $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 70 }], changed: ['rateLimits'] } as never)
-  expect((await ui.find({ type: 'Text', text: /%/ }))?.text).toBe(before)
+  await ui.advance(1000)
+  expect(await session()).toBe(before)
   expect(before).toBe('<1%')
   await ui.unmount()
 })
@@ -554,7 +556,7 @@ test('every band state reads "used / limit", with an icon on each status, on bot
   expect([stopped.word, stopped.icons[0], stopped.fig]).toEqual(['Stopped', 'Stopped', '11m / 10m'])
 })
 
-test('the pane holds still while a setting has the focus, then catches up', async ($, on) => {
+test('a running prompt moves only its figures: the pane, its dropdowns and buttons are not drawn again', async ($, on) => {
   let draws = 0
   let isDrawing = false
   on('command.register', () => ({ value: { command: 'fence' } }))
@@ -570,41 +572,39 @@ test('the pane holds still while a setting has the focus, then catches up', asyn
     value: { startedAt: 0, context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] },
   }))
   on('session.measure', () => ({ changed: [] }))
-  // The ring lands wherever the person sends it.
   on('ui.focus', { plugin: '*' }, () => ({}) as never)
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.turn.start({ text: 'go', turnId: 't1' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, isFocused: true } })
-  const hint = async () => (await ui.find({ type: 'Text', text: /of 10% used/ }))?.text
+  const hint = async () => (await ui.find({ type: 'Text', in: 'live-hint-share' }))?.text
   const measure = (percentUsed: number) =>
     $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed }], changed: ['rateLimits'] } as never)
   expect(await hint()).toBe('<1% of 10% used')
 
-  isDrawing = true
+  // Only the figures' own ticks ask for the clock from here on; drawings are counted apart.
+  const drawsOf = async (act: () => Promise<unknown>) => {
+    isDrawing = true
+    draws = 0
+    await act()
+    // A read waits for any drawing the act asked for.
+    await ui.find({ type: 'Button', key: 'toggle' })
+    isDrawing = false
+    return draws
+  }
+  expect(await drawsOf(() => measure(42))).toBe(0)
+  await ui.advance(1000)
+  expect(await hint()).toBe('~2.0% of 10% used')
+
+  // With a dropdown in focus too: the figure moves, the pane does not.
   const focus = (element: string) =>
     $.ui.focus({ requestId: 'budget-fence', key: element, component: 'Pane', plugin: 'budget-fence', element, origin: { kind: 'person' } } as never)
-  expect((await focus('limit-share')).deny).toBe(undefined)
-  await measure(42)
-  await measure(43)
-  // Neither the focus landing nor the run moving drew the pane again.
-  expect(draws).toBe(0)
-  expect(await hint()).toBe('<1% of 10% used')
-
-  await focus('toggle')
-  expect(await hint()).toBe('~3.0% of 10% used')
-  expect(draws).toBe(1)
-  await measure(44)
-  expect(await hint()).toBe('~4.0% of 10% used')
-
-  // Focus that leaves the pane without a move reported still frees the figures.
   await focus('limit-share')
-  await measure(45)
+  expect(await drawsOf(() => measure(44))).toBe(0)
+  await ui.advance(1000)
   expect(await hint()).toBe('~4.0% of 10% used')
-  await ui.redraw({ ...PANE.props, isFocused: false })
-  await measure(46)
-  expect(await hint()).toBe('~6.0% of 10% used')
+  expect((await ui.find({ type: 'Select', key: 'limit-share' }))?.props.value).toBe('10')
   await ui.unmount()
 })
 
