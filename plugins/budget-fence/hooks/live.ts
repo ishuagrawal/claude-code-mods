@@ -78,7 +78,7 @@ export function drawPrompt({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, 
           ],
         }),
         view.prompt ? Text({ wrap: 'truncate-end', color: 'subtle', children: view.prompt }) : null,
-        view.note ? Text({ size: 'footnote', color: 'warning', children: view.note }) : null,
+        view.note ? Text({ size: 'footnote', color: 'error', children: view.note }) : null,
         view.loops ? Text({ size: 'footnote', color: 'subtle', wrap: 'truncate-end', children: view.loops }) : null,
       ],
     })

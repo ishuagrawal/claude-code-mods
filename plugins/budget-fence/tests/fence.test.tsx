@@ -173,9 +173,10 @@ test('the band shows a gauge per limit while a prompt runs', async ($, on) => {
   } as never)
   expect((await ui.find({ type: 'Text', text: /\/ 10/ }))?.text).toBe('<1% / 10%')
   expect((await ui.find({ type: 'Button', key: 'details' }))?.props.label).toBe('⋯')
-  // Box sizes are cells, so the desktop bar is a 64×4 px Svg, not a Box.
+  // The limit's icon is its meter: one ring icon, saying how full the limit is.
   const svgs = await ui.findAll({ type: 'Svg' })
-  expect(svgs.map(x => [x.props.width, x.props.height])).toEqual([[16, 16], [64, 4]])
+  expect(svgs.map(x => [x.props.width, x.props.height, x.props.alt])).toEqual([[20, 20, 'Session, 0% of the limit']])
+  expect(await ui.find({ type: 'Text', text: /^[○◔◑◕●]$/ })).toBe(undefined)
   expect((await ui.findAll({ type: 'Box' })).every(x => x.props.width === undefined && x.props.height === undefined)).toBe(true)
   await ui.unmount()
 })
@@ -542,7 +543,7 @@ test('every band state reads "used / limit", with an icon on each status, on bot
     expect(await band(surface)).toEqual({
       fig: '2m / 10m',
       word: undefined,
-      icons: surface === 'desktop' ? ['Time', '20% of the limit', 'Tokens'] : [],
+      icons: surface === 'desktop' ? ['Time, 20% of the limit', 'Tokens, 0% of the limit'] : [],
       dividers: 1,
     })
   }
@@ -555,7 +556,7 @@ test('every band state reads "used / limit", with an icon on each status, on bot
     expect(await band(surface)).toEqual({
       fig: '11m / 10m',
       word: 'Paused',
-      icons: surface === 'desktop' ? ['Paused', 'Time', '100% of the limit'] : [],
+      icons: surface === 'desktop' ? ['Paused', 'Time, 100% of the limit'] : [],
       dividers: 1,
     })
   }

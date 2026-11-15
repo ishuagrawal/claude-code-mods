@@ -534,38 +534,41 @@ export const register: Register = on => {
     const isPaused = run.status === 'paused'
     const isStopped = run.status === 'denied'
     const isHalted = isPaused || isStopped
-    // Halted, the whole row takes the state's color, as the pane does: amber waiting, red stopped.
-    const leadLevel: Level = isPaused ? 'warning' : isStopped ? 'error' : levelOf(lead.g.used, lead.g.cap)
+    // Halted, paused or stopped, the whole row turns red, as the pane does.
+    const leadLevel: Level = isHalted ? 'error' : levelOf(lead.g.used, lead.g.cap)
 
-    // One spacing scale for every state: an icon sits tight to what it labels,
-    // the bar a step from its figure, and groups well apart.
+    // One spacing scale for every state: an icon and its pie sit tight to what they
+    // label, and groups well apart.
     const tight: Space = isTerminal ? 1 : 'xs'
-    const item: Space = isTerminal ? 1 : 'sm'
     const group: Space = isTerminal ? 2 : 'md'
-    const between: Space = isTerminal ? 3 : 'lg'
 
-    const bar = (ratio: number) => {
-      const r = Math.min(1, Math.max(0, ratio))
-      const fill = leadLevel === 'error' ? ERROR_HEX : leadLevel === 'warning' ? WARNING_HEX : ACCENT_HEX
+    // Each limit's icon is its meter: a ring around the icon fills as the limit fills, in the
+    // limit's own color, amber from 80% and red at the limit (and red while halted). One element
+    // per limit, not an icon and a separate meter, so the icon and its figure read as one group.
+    // The terminal has no images: its glyph, then a pie in quarters.
+    const levelHex = (gauge: Gauge, ratio: number) => {
+      const level = isHalted ? leadLevel : levelOf(ratio, 1)
+      return level === 'error' ? ERROR_HEX : level === 'warning' ? WARNING_HEX : ICON_COLORS[BAND_ICONS[gauge]]
+    }
+    const meter = (gauge: Gauge, ratio: number) => {
+      const hex = levelHex(gauge, ratio)
       if (!Svg) {
-        const filled = r > 0 ? Math.max(1, Math.round(r * BAR_CELLS)) : 0
-        return (
-          <Box key="bar" flexDirection="row">
-            <Text color={leadLevel ?? 'suggestion'}>{'━'.repeat(filled)}</Text>
-            <Text dimColor>{'━'.repeat(BAR_CELLS - filled)}</Text>
-          </Box>
-        )
+        return [
+          icon(BAND_ICONS[gauge], GAUGE_NAMES[gauge]),
+          <Text key="pie" color={hex}>
+            {pieOf(ratio)}
+          </Text>,
+        ]
       }
-      const w = Math.round(r * BAR_PX)
-      return (
+      return [
         <Svg
-          key="bar"
-          alt={`${Math.round(r * 100)}% of the limit`}
-          width={BAR_PX}
-          height={BAR_HEIGHT}
-          source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${BAR_PX} ${BAR_HEIGHT}"><rect width="${BAR_PX}" height="${BAR_HEIGHT}" rx="2" fill="${TRACK}"/>${w > 0 ? `<rect width="${w}" height="${BAR_HEIGHT}" rx="2" fill="${fill}"/>` : ''}</svg>`}
-        />
-      )
+          key={`ring-${gauge}`}
+          alt={`${GAUGE_NAMES[gauge]}, ${Math.round(Math.min(1, ratio) * 100)}% of the limit`}
+          width={RING_PX}
+          height={RING_PX}
+          source={ringSvg(BAND_ICONS[gauge], ratio, hex)}
+        />,
+      ]
     }
 
     // Every state reads the same way, "used / limit", with the used part in the row's color.
@@ -607,31 +610,27 @@ export const register: Register = on => {
 
     // What fits: the lead always; the others while there is room.
     const columns = e.props.bodyColumns ?? 80
-    const room = Math.max(0, Math.floor((columns - 30) / 9))
+    const room = Math.max(0, Math.floor((columns - 30) / 10))
     const others = isHalted ? [] : rest.slice(0, room)
+
+    // Each group is tight inside (its meter and its figure) and set apart from the next by a
+    // divider with a wide gap either side, so which figure belongs to which icon is plain.
+    const groups = [
+      status,
+      pair('lead', [...meter(lead.gauge, lead.ratio), figure]),
+      ...others.map(o =>
+        pair(o.gauge, [
+          ...meter(o.gauge, o.ratio),
+          <Text key="pct" size="footnote" tabular color={levelOf(o.g.used, o.g.cap) ?? 'subtle'}>
+            {`${Math.min(999, Math.round(o.ratio * 100))}%`}
+          </Text>,
+        ]),
+      ),
+    ].filter(g => g !== null)
 
     return (
       <Box flexDirection="row" alignItems="center" columnGap={group}>
-        {status}
-        {status ? divider('status-divider') : null}
-        {pair('lead', [icon(BAND_ICONS[lead.gauge], GAUGE_NAMES[lead.gauge]), pair('meter', [bar(lead.ratio), figure], item)])}
-        {others.length > 0 ? divider('others-divider') : null}
-        {others.length > 0 ? (
-          <Box key="others" flexDirection="row" alignItems="center" columnGap={between}>
-            {others.map(o => {
-              const level = levelOf(o.g.used, o.g.cap)
-              return pair(
-                o.gauge,
-                [
-                  icon(BAND_ICONS[o.gauge], GAUGE_NAMES[o.gauge]),
-                  <Text key="pct" size="footnote" tabular color={level ?? 'subtle'}>
-                    {`${Math.min(999, Math.round(o.ratio * 100))}%`}
-                  </Text>,
-                ],
-              )
-            })}
-          </Box>
-        ) : null}
+        {groups.flatMap((g, n) => (n === 0 ? [g] : [divider(`divider-${n}`), g]))}
         <Box key="spacer" flexGrow={1} />
         <Button key="details" plain dimColor label="⋯" onPress={() => void $.ui.open({ id: PANE, title: TITLE })} />
       </Box>
@@ -1008,8 +1007,8 @@ function shortAmount(gauge: Gauge, n: number): string {
   }
 }
 
-/** Running in blue, paused in amber, stopped in red, finished quiet. */
-const STATUS_COLORS = { running: 'suggestion', paused: 'warning', denied: 'error', done: 'subtle' } as const
+/** Running in blue, paused or stopped in red, finished quiet. */
+const STATUS_COLORS = { running: 'suggestion', paused: 'error', denied: 'error', done: 'subtle' } as const
 
 function statusWord(run: FenceRun, now: number): string {
   switch (run.status) {
@@ -1089,7 +1088,7 @@ const ICON_COLORS: Record<IconName, string> = {
   weekly: '#e0874f',
   shield: '#3fa65f',
   shieldOff: ICON_STROKE,
-  pause: '#e0a32f',
+  pause: '#e0524f',
   stop: '#e0524f',
 }
 const GLYPH_COLORS: Record<IconName, 'suggestion' | 'merged' | 'planMode' | 'claude' | 'success' | 'subtle' | 'warning' | 'error'> = {
@@ -1099,7 +1098,7 @@ const GLYPH_COLORS: Record<IconName, 'suggestion' | 'merged' | 'planMode' | 'cla
   weekly: 'claude',
   shield: 'success',
   shieldOff: 'subtle',
-  pause: 'warning',
+  pause: 'error',
   stop: 'error',
 }
 
@@ -1107,18 +1106,33 @@ const GLYPH_COLORS: Record<IconName, 'suggestion' | 'merged' | 'planMode' | 'cla
 const BAND_GAUGES: Gauge[] = ['minutes', 'tokens', 'share', 'weeklyShare']
 const BAND_ICONS: Record<Gauge, IconName> = { minutes: 'clock', tokens: 'tokens', share: 'session', weeklyShare: 'weekly' }
 const GAUGE_NAMES: Record<Gauge, string> = { minutes: 'Time', tokens: 'Tokens', share: 'Session', weeklyShare: 'Weekly' }
-const BAR_CELLS = 10
-const BAR_PX = 64
-const BAR_HEIGHT = 4
-const ACCENT_HEX = '#4f8fe0'
-/** How much closer another limit must be before it takes the bar. */
+/** How much closer another limit must be before it takes the lead. */
 const LEAD_MARGIN = 0.05
-const TRACK = 'rgba(139, 145, 156, 0.25)'
-/** Darker than the bar's track: a 1px line at the track's alpha disappears on a dark backdrop. */
+/** A 1px divider, dark enough to show on a dark backdrop. */
 const DIVIDER = 'rgba(139, 145, 156, 0.45)'
 const DIVIDER_HEIGHT = 12
 const WARNING_HEX = '#e0a32f'
 const ERROR_HEX = '#e0524f'
+/** The band's ring icons: a little larger than a plain icon, for the ring around it. */
+const RING_PX = 20
+const RING_TRACK = 'rgba(139, 145, 156, 0.3)'
+
+/** An icon inside a ring that fills clockwise from the top as its limit fills. */
+function ringSvg(name: IconName, ratio: number, color: string): string {
+  const r = 10.5
+  const length = 2 * Math.PI * r
+  const filled = Math.min(1, Math.max(0, ratio)) * length
+  const arc =
+    filled > 0
+      ? `<circle cx="12" cy="12" r="${r}" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-dasharray="${filled.toFixed(2)} ${length.toFixed(2)}" transform="rotate(-90 12 12)"/>`
+      : ''
+  return (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">' +
+    `<circle cx="12" cy="12" r="${r}" stroke="${RING_TRACK}" stroke-width="2"/>${arc}` +
+    `<g transform="translate(12 12) scale(0.5) translate(-12 -12)" stroke="${ICON_COLORS[name]}" stroke-width="2.6">${ICON_PATHS[name]}</g>` +
+    '</svg>'
+  )
+}
 
 /**
  * The usage gauge, shrunk to the top-left, with the window's length set in the
