@@ -382,7 +382,12 @@ test('recent prompts start collapsed and open on a press', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: 'tidy the README' })).toBe(undefined)
   await ui.press({ key: 'recent-toggle' })
   expect((await ui.find({ type: 'Text', text: 'tidy the README' }))?.text).toBe('tidy the README')
-  expect((await ui.find({ type: 'Text', text: /tokens/ }))?.text).toBe('1m · 1k tokens')
+  // Its figures each carry their own colored icon, the weekly share included even under 1%.
+  const texts = (await ui.findAll({ type: 'Text' })).map(x => x.text)
+  expect(['1m', '1k'].every(v => texts.includes(v))).toBe(true)
+  expect(texts.some(v => /^~?0\.3%$/.test(v))).toBe(true)
+  const alts = (await ui.findAll({ type: 'Svg' })).map(x => x.props.alt)
+  expect(['Time', 'Tokens', 'Weekly'].every(a => alts.includes(a))).toBe(true)
   await ui.unmount()
 })
 

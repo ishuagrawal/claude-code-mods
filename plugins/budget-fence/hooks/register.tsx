@@ -692,7 +692,6 @@ export const register: Register = on => {
     ])
     const now = await $.clock.now()
     const icon = iconFor($, e)
-    const columns = e.props.bodyColumns ?? 60
     // What this drawing's rings show, so the head's tick redraws only when one steps.
     if (run) pane.rings = ringsKey(run, limits, now)
 
@@ -861,7 +860,7 @@ export const register: Register = on => {
                 />
               </Box>,
             )}
-            {isRecentOpen ? recent.map(entry => historyRow(Box, Text, entry, now, columns)) : null}
+            {isRecentOpen ? recent.map(entry => historyRow(Box, Text, icon, entry, now)) : null}
           </Box>
         ) : null}
       </Box>
@@ -872,7 +871,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: HISTORY_PANE }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const [history, now] = await Promise.all([read($, historyAtom), $.clock.now()])
-    const columns = e.props.bodyColumns ?? 60
+    const icon = iconFor($, e)
     if (history.length === 0) {
       return <Text color="subtle">Finished prompts show here, with the time, tokens and limits each used.</Text>
     }
@@ -914,7 +913,7 @@ export const register: Register = on => {
           />
         </Box>
         <Box flexDirection="column" rowGap="md">
-          {history.map(entry => historyRow(Box, Text, entry, now, columns))}
+          {history.map(entry => historyRow(Box, Text, icon, entry, now))}
         </Box>
       </Box>
     )
@@ -1111,19 +1110,25 @@ function savedShare(value: number, isExact: boolean | undefined): string {
 
 /**
  * One finished prompt: its title on one line, cut off at the edge, with when it finished in a
- * fixed column on the right; under it, what it spent and anything unusual. Nothing wraps.
+ * fixed column on the right; under it, what it spent, each figure with its own colored icon as
+ * in the pane (time, tokens, the session limit where the plan has one, the weekly limit), and
+ * anything unusual. Nothing wraps.
  */
-function historyRow(Box: Table['Box'], Text: Table['Text'], entry: FenceHistoryEntry, now: number, _columns: number) {
-  // Shares under 1% say nothing on nearly every row, so only a real share is listed.
-  const share = (value: number | null, isExact: boolean | undefined, name: string) =>
-    value !== null && value >= 1 ? `${savedShare(value, isExact)} of ${name} limit` : null
-  const spent = [
-    duration(entry.activeMs),
-    `${tokens(entry.tokens)} tokens`,
-    share(entry.sessionPct, entry.sessionIsExact, 'session'),
-    share(entry.weeklyPct, entry.weeklyIsExact, 'weekly'),
-    entry.agents > 0 ? `${entry.agents} ${entry.agents === 1 ? 'subagent' : 'subagents'}` : null,
-  ].filter(Boolean)
+function historyRow(
+  Box: Table['Box'],
+  Text: Table['Text'],
+  icon: (name: IconName, alt: string) => RenderChildren,
+  entry: FenceHistoryEntry,
+  now: number,
+) {
+  const figure = (key: string, glyph: IconName, name: string, value: string) => (
+    <Box key={key} flexDirection="row" alignItems="center" columnGap="xs" flexShrink={0}>
+      {icon(glyph, name)}
+      <Text size="footnote" tabular color="subtle">
+        {value}
+      </Text>
+    </Box>
+  )
   // What went differently, in red: a prompt the fence stopped, or one it paused.
   const flag = entry.wasStopped ? 'Stopped' : entry.pauses > 0 ? `Paused ${entry.pauses}×` : null
   return (
@@ -1140,10 +1145,22 @@ function historyRow(Box: Table['Box'], Text: Table['Text'], entry: FenceHistoryE
           </Text>
         </Box>
       </Box>
-      <Text size="footnote" tabular color="subtle" wrap="truncate-end">
-        {spent.join(' · ')}
-        {flag ? <Text color="error">{`  ${flag}`}</Text> : null}
-      </Text>
+      <Box flexDirection="row" alignItems="center" columnGap="md" overflow="hidden">
+        {figure('time', 'clock', 'Time', duration(entry.activeMs))}
+        {figure('tokens', 'tokens', 'Tokens', tokens(entry.tokens))}
+        {entry.sessionPct !== null ? figure('session', 'session', 'Session', savedShare(entry.sessionPct, entry.sessionIsExact)) : null}
+        {entry.weeklyPct !== null ? figure('weekly', 'weekly', 'Weekly', savedShare(entry.weeklyPct, entry.weeklyIsExact)) : null}
+        {entry.agents > 0 ? (
+          <Text key="agents" size="footnote" color="subtle" wrap="truncate-end">
+            {`${entry.agents} ${entry.agents === 1 ? 'subagent' : 'subagents'}`}
+          </Text>
+        ) : null}
+        {flag ? (
+          <Text key="flag" size="footnote" color="error" wrap="truncate-end">
+            {flag}
+          </Text>
+        ) : null}
+      </Box>
     </Box>
   )
 }
