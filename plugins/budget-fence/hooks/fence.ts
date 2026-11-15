@@ -433,7 +433,7 @@ function tokenCount(word: string): number | null {
 }
 
 /** Parses `/fence` arguments; answers the new limits or a message. */
-export function parseArgs(args: string, limits: FenceLimits): { limits: FenceLimits; said: string } | { error: string } {
+export function parseArgs(args: string, limits: FenceLimits, hasSession = true): { limits: FenceLimits; said: string } | { error: string } {
   const words = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
   let next = { ...limits }
   for (let i = 0; i < words.length; i++) {
@@ -462,18 +462,22 @@ export function parseArgs(args: string, limits: FenceLimits): { limits: FenceLim
       }
     }
   }
-  return { limits: next, said: describe(next) }
+  return { limits: next, said: describe(next, hasSession) }
 }
 
-export function describe(limits: FenceLimits): string {
+/** What the fence will do, in a sentence. `hasSession` is false when the plan has no 5-hour window to measure. */
+export function describe(limits: FenceLimits, hasSession = true): string {
   if (!limits.isOn) return 'Budget fence is off. Your limits are kept for when you turn it on.'
   const parts = [
     limits.minutes > 0 ? `${duration(limits.minutes * 60_000)} of work` : null,
     limits.tokens > 0 ? `${tokens(limits.tokens)} tokens` : null,
-    limits.share > 0 ? `${pct(limits.share)} of the session limit` : null,
+    hasSession && limits.share > 0 ? `${pct(limits.share)} of the session limit` : null,
     limits.weeklyShare > 0 ? `${pct(limits.weeklyShare)} of the weekly limit` : null,
   ].filter(Boolean)
-  return parts.length > 0 ? `Each prompt pauses at ${parts.join(', ')}.` : 'Budget fence is on with no limits set.'
+  const said = parts.length > 0 ? `Each prompt pauses at ${parts.join(', ')}.` : 'Budget fence is on, but no limit is set that applies to your plan.'
+  return !hasSession && limits.share > 0
+    ? `${said} Your plan has no session limit, so the ${pct(limits.share)} session limit does nothing; /fence session off clears it.`
+    : said
 }
 
 /** Reads what the person typed as a custom value for one setting; null when it makes no sense. */

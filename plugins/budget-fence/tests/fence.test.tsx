@@ -6,6 +6,7 @@ import {
   loopShare,
   meterOf,
   newRun,
+  describe,
   parseArgs,
   pct,
   usedOf,
@@ -95,6 +96,17 @@ test('/fence arguments set the limits', async () => {
   expect('error' in parseArgs('bananas', DEFAULT_LIMITS)).toBe(true)
 })
 
+test('/fence says when the session limit cannot apply to the plan', async () => {
+  const sessionOnly = { ...DEFAULT_LIMITS, weeklyShare: 0 }
+  expect(describe(sessionOnly)).toBe('Each prompt pauses at 10% of the session limit.')
+  expect(describe(sessionOnly, false)).toBe(
+    'Budget fence is on, but no limit is set that applies to your plan. Your plan has no session limit, so the 10% session limit does nothing; /fence session off clears it.',
+  )
+  expect(describe(DEFAULT_LIMITS, false)).toContain('Each prompt pauses at 2.0% of the weekly limit.')
+  const parsed = parseArgs('session off', sessionOnly, false)
+  expect('said' in parsed && parsed.said).toBe('Budget fence is on, but no limit is set that applies to your plan.')
+})
+
 const PANE = {
   plugin: 'budget-fence',
   component: 'Pane',
@@ -138,7 +150,7 @@ test('a plan with only a weekly window is measured against it, with its own shar
   expect(tripOf(run, shareOnly, 0)?.reason).toBe('This prompt has used 2.1% of your weekly limit')
 })
 
-test('the band shows the meter while a prompt runs', async ($, on) => {
+test('the band shows a gauge per limit while a prompt runs', async ($, on) => {
   on('command.register', () => ({ value: { command: 'fence' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('store.get', () => ({ value: { isOn: true, share: 10 } }))
@@ -157,7 +169,12 @@ test('the band shows the meter while a prompt runs', async ($, on) => {
     surface: 'desktop',
     props: { hasSurvey: false, isCollapsed: false, bodyColumns: 80, maxRows: 4 },
   } as never)
-  expect((await ui.find({ type: 'Text', text: /session/ }))?.text).toBe('<1% session of 10% session')
+  expect((await ui.find({ type: 'Text', text: /\/ 10/ }))?.text).toBe('<1% / 10%')
+  expect((await ui.find({ type: 'Button', key: 'details' }))?.props.label).toBe('⋯')
+  // Box sizes are cells, so the desktop bar is a 64×4 px Svg, not a Box.
+  const svgs = await ui.findAll({ type: 'Svg' })
+  expect(svgs.map(x => [x.props.width, x.props.height])).toEqual([[16, 16], [64, 4]])
+  expect((await ui.findAll({ type: 'Box' })).every(x => x.props.width === undefined && x.props.height === undefined)).toBe(true)
   await ui.unmount()
 })
 

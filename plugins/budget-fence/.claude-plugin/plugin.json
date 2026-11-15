@@ -1,6 +1,6 @@
 {
   "name": "budget-fence",
-  "version": "0.6.0",
+  "version": "0.1.0",
   "description": "Pause a prompt before it runs too long, uses too many tokens or eats too much of your usage limit, with limits you can change mid-prompt.",
   "types": "./types/index.d.ts"
 }

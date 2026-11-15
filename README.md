@@ -6,12 +6,12 @@ Mods for Claude Code that make a session easier to read and steer.
 
 Pauses a prompt before it runs too long, uses too many tokens, or eats too much of your usage limit, without changing how Claude works. It starts **off**; turn it on in its pane.
 
-- **The pane** (`/fence`, or **Adjust limits** on the row above the prompt) holds everything:
+- **The pane** (`/fence`, or **⋯** on the row above the prompt) holds everything:
   - an on/off switch; your limits are kept while it is off
   - **This prompt / Last prompt**: time, tokens, and its share of the session and weekly limits, amber near a limit and red at it
   - **Pause a prompt after**: one dropdown per limit, each with presets, **No limit**, and **Custom…** for any value you type. Changes apply to the prompt already running.
   - **Recent prompts**, collapsed by default, and **View all** for the full history (kept across sessions)
-- **While Claude works**, one quiet row above the prompt shows the limit closest to tripping.
+- **While Claude works**, one row above the prompt shows the limit closest to its cap as its icon, a bar, and `used / limit` (`3m left` in amber near it, red when paused), and each other limit as its icon and a percent. On a narrow window the other limits drop off first. **⋯** opens the pane.
 - **When a limit is reached**, the next tool call waits on the app's own approval prompt. Allow raises that limit by half; Deny tells Claude it hit your fence, and it wraps up.
 
 The fence never tells Claude about the budget, so it never cuts corners to fit. It only watches and asks.

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { Elements, EngineInterface, Register, RenderChildren, Space } from 'claude-code'
 
 import type { FenceCalibration, FenceHistoryEntry, FenceLimits, FenceRun, FenceTally } from '../types'
 import {
@@ -11,7 +11,6 @@ import {
   duration,
   gaugeOf,
   loopShare,
-  meterOf,
   newRun,
   parseArgs,
   pct,
@@ -43,21 +42,21 @@ const PANE = 'budget-fence'
 const TITLE = 'Budget fence'
 const STORE_KEY = 'limits'
 
-const limitsAtom = atom({ plugin: 'budget-fence', key: 'limits' } as const, DEFAULT_LIMITS, { shape: 'limits-4' })
-const runAtom = atom({ plugin: 'budget-fence', key: 'run' } as const, null, { shape: 'run-5' })
+const limitsAtom = atom({ plugin: 'budget-fence', key: 'limits' } as const, DEFAULT_LIMITS, { shape: 'limits-1' })
+const runAtom = atom({ plugin: 'budget-fence', key: 'run' } as const, null, { shape: 'run-1' })
 const historyAtom = atom({ plugin: 'budget-fence', key: 'history' } as const, [], { shape: 'history-1' })
 const HISTORY_PANE = 'budget-fence-history'
 const HISTORY_KEY = 'history'
-// v2 learns per model; the v1 totals mixed models together and are dropped.
-const CALIBRATION_KEY = 'calibration-2'
+// What each model has learned about its rate, keyed by model.
+const CALIBRATION_KEY = 'calibration'
 const editingAtom = atom({ plugin: 'budget-fence', key: 'editing' } as const, null, { shape: 'editing-1' })
 const recentOpenAtom = atom({ plugin: 'budget-fence', key: 'recentOpen' } as const, false, { shape: 'recent-1' })
 const planAtom = atom({ plugin: 'budget-fence', key: 'plan' } as const, null, { shape: 'plan-1' })
 
-/** Limits saved by this or an earlier version, filled out with today's defaults. */
+/** Saved limits, checked key by key and filled out with the defaults. */
 function savedLimits(value: unknown): FenceLimits | null {
   if (typeof value !== 'object' || value === null) return null
-  // Only today's keys: an earlier version's usage-limit and repeat-failure settings are dropped.
+  // Only known keys of the right type are kept.
   const saved = value as Partial<FenceLimits>
   const v: FenceLimits = { ...DEFAULT_LIMITS }
   for (const key of Object.keys(DEFAULT_LIMITS) as (keyof FenceLimits)[]) {
@@ -88,6 +87,8 @@ async function notePlan($: EngineInterface, readings: readonly Reading[]) {
 export const register: Register = on => {
   // Calls paused by the fence, by tool_use_id: what tripped, and in which loop.
   const pending = new Map<string, { trip: Trip; loopId: string }>()
+  // Which limit holds the band's bar.
+  let leadGauge: Gauge | null = null
   // The text of the prompt last sent, for the run it starts.
   let lastPrompt = ''
 
@@ -108,13 +109,14 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'fence' }, async ($, e) => {
-    const limits = await read($, limitsAtom)
+    const [limits, plan] = await Promise.all([read($, limitsAtom), read($, planAtom)])
+    const hasSession = plan?.hasSession ?? true
     if (e.args.trim() === '') {
       void $.ui.open({ id: PANE, title: TITLE })
 
-      return { text: `${describe(limits)} Adjust the limits in the Budget fence pane.` }
+      return { text: `${describe(limits, hasSession)} Adjust the limits in the Budget fence pane.` }
     }
-    const parsed = parseArgs(e.args, limits)
+    const parsed = parseArgs(e.args, limits, hasSession)
     if ('error' in parsed) return { text: parsed.error }
     await update($, limitsAtom, () => parsed.limits)
     await $.store.set(STORE_KEY, parsed.limits)
@@ -266,49 +268,135 @@ export const register: Register = on => {
     return ran
   }).catch(($, e, next) => next(e))
 
-  // The band: one quiet row while a prompt runs, the only place the fence speaks.
+  // The band: the limit closest to its cap gets a bar; the rest sit beside it as icon and percent.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const [run, limits] = await Promise.all([read($, runAtom), read($, limitsAtom)])
     if (!run || run.status === 'done' || !limits.isOn) return next(e)
-    const { Box, Button, Text } = $.ui.resolve(e)
-    const details = (
-      <Button key="details" plain dimColor label="Adjust limits" onPress={() => void $.ui.open({ id: PANE, title: TITLE })} />
-    )
+    const table = $.ui.resolve(e)
+    const { Box, Button, Text } = table
+    // Box sizes and gaps are in cells on every surface; a graphical surface draws thin shapes as Svg, in CSS pixels.
+    const Svg = e.surface !== 'terminal' && 'Svg' in table ? (table as Elements['desktop']).Svg : undefined
+    const icon = iconFor($, e)
+    const isTerminal = e.surface === 'terminal'
+    const now = await $.clock.now()
 
-    if (run.status === 'paused' || run.status === 'denied') {
-      const isPaused = run.status === 'paused'
-      return (
-        <Box flexDirection="row" alignItems="center" columnGap="sm">
-          <Text weight="medium" color={isPaused ? 'warning' : 'subtle'}>
-            {isPaused ? 'Paused' : 'Stopped at your fence'}
-          </Text>
-          <Box flexGrow={1} flexShrink={1}>
-            <Text wrap="truncate-end" color="subtle">
-              {isPaused ? `${run.reason ?? 'A limit was reached'}. Waiting for your OK.` : 'Claude is wrapping up.'}
-            </Text>
+    const gauges = BAND_GAUGES.flatMap(gauge => {
+      const g = gaugeOf(run, limits, gauge, now)
+      return g && g.cap > 0 ? [{ gauge, g, ratio: g.used / g.cap }] : []
+    })
+    if (gauges.length === 0) return next(e)
+    // The lead only changes hands when another limit is clearly closer, so the bar does not flicker.
+    const top = gauges.reduce((a, b) => (b.ratio > a.ratio ? b : a))
+    const held = gauges.find(x => x.gauge === leadGauge)
+    const lead = held && top.ratio - held.ratio < LEAD_MARGIN ? held : top
+    leadGauge = lead.gauge
+    const rest = gauges.filter(x => x !== lead)
+
+    const isPaused = run.status === 'paused'
+    const isStopped = run.status === 'denied'
+    const leadLevel: Level = isPaused || isStopped ? 'error' : levelOf(lead.g.used, lead.g.cap)
+
+    const bar = (ratio: number) => {
+      const r = Math.min(1, Math.max(0, ratio))
+      const fill = leadLevel === 'error' ? ERROR_HEX : leadLevel === 'warning' ? WARNING_HEX : ACCENT_HEX
+      if (!Svg) {
+        const filled = r > 0 ? Math.max(1, Math.round(r * BAR_CELLS)) : 0
+        return (
+          <Box key="bar" flexDirection="row">
+            <Text color={leadLevel ?? 'suggestion'}>{'━'.repeat(filled)}</Text>
+            <Text dimColor>{'━'.repeat(BAR_CELLS - filled)}</Text>
           </Box>
-          {details}
-        </Box>
+        )
+      }
+      const w = Math.round(r * BAR_PX)
+      return (
+        <Svg
+          key="bar"
+          alt={`${Math.round(r * 100)}% of the limit`}
+          width={BAR_PX}
+          height={BAR_HEIGHT}
+          source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${BAR_PX} ${BAR_HEIGHT}"><rect width="${BAR_PX}" height="${BAR_HEIGHT}" rx="2" fill="${TRACK}"/>${w > 0 ? `<rect width="${w}" height="${BAR_HEIGHT}" rx="2" fill="${fill}"/>` : ''}</svg>`}
+        />
       )
     }
 
-    const meter = meterOf(run, limits, await $.clock.now())
-    const agents = run.loops.filter(l => l.id !== MAIN && l.isRunning).length
-    const parts = [
-      meter?.text ?? null,
-      agents > 0 ? `${agents} ${agents === 1 ? 'agent' : 'agents'} running` : null,
-    ].filter(Boolean)
-    if (parts.length === 0) return next(e)
+    // Calm: "7m / 20m". Near the cap: "3m left". Paused: what it reached.
+    const figure =
+      isPaused || isStopped ? (
+        <Text key="fig" size="footnote" tabular color="error">
+          {lead.g.share ? shareText(lead.g.share) : shortAmount(lead.gauge, lead.g.used)}
+        </Text>
+      ) : leadLevel === 'warning' ? (
+        <Text key="fig" size="footnote" tabular color="warning">
+          {shortAmount(lead.gauge, Math.max(0, lead.g.cap - lead.g.used))} left
+        </Text>
+      ) : (
+        <Text key="fig" size="footnote" tabular>
+          {lead.g.share ? shareText(lead.g.share) : shortAmount(lead.gauge, lead.g.used)}
+          <Text dimColor>{` / ${shortAmount(lead.gauge, lead.g.cap)}`}</Text>
+        </Text>
+      )
+
+    // Icon and number sit tight; limits sit well apart, so each number reads with its own icon.
+    const pair = (key: string, children: RenderChildren, gap: Space = isTerminal ? 0 : 'xs') => (
+      <Box key={key} flexDirection="row" alignItems="center" columnGap={gap}>
+        {children}
+      </Box>
+    )
+    const divider = Svg ? (
+      <Svg
+        key="divider"
+        alt=""
+        width={1}
+        height={14}
+        source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 14"><rect width="1" height="14" fill="${TRACK}"/></svg>`}
+      />
+    ) : (
+      <Text key="divider" dimColor>
+        │
+      </Text>
+    )
+    const status =
+      isPaused || isStopped
+        ? pair(
+            'status',
+            <Text size="footnote" weight="medium" color="error">
+              {isPaused ? '❚❚ Paused' : 'Stopped'}
+            </Text>,
+          )
+        : null
+
+    // What fits: the lead always; the others while there is room.
+    const columns = e.props.bodyColumns ?? 80
+    const room = Math.max(0, Math.floor((columns - 30) / (isTerminal ? 8 : 9)))
+    const others = isPaused || isStopped ? [] : rest.slice(0, room)
+    const between: Space = isTerminal ? 3 : 'lg'
 
     return (
-      <Box flexDirection="row" alignItems="center" columnGap="sm">
-        <Box flexGrow={1} flexShrink={1}>
-          <Text size="footnote" tabular wrap="truncate-end" color={meter ? (meter.ratio >= 1 ? 'error' : meter.isWarning ? 'warning' : 'subtle') : 'subtle'}>
-            {parts.join(' · ')}
-          </Text>
-        </Box>
-        {details}
+      <Box flexDirection="row" alignItems="center" columnGap={isTerminal ? 2 : 'md'}>
+        {status}
+        {status ? divider : null}
+        {pair('lead', [icon(BAND_ICONS[lead.gauge], GAUGE_NAMES[lead.gauge]), bar(lead.ratio), figure], isTerminal ? 1 : 'sm')}
+        {others.length > 0 ? divider : null}
+        {others.length > 0 ? (
+          <Box key="others" flexDirection="row" alignItems="center" columnGap={between}>
+            {others.map(o => {
+              const level = levelOf(o.g.used, o.g.cap)
+              return pair(
+                o.gauge,
+                [
+                  icon(BAND_ICONS[o.gauge], GAUGE_NAMES[o.gauge]),
+                  <Text key="pct" size="footnote" tabular color={level ?? 'subtle'}>
+                    {`${Math.min(999, Math.round(o.ratio * 100))}%`}
+                  </Text>,
+                ],
+              )
+            })}
+          </Box>
+        ) : null}
+        <Box key="spacer" flexGrow={1} />
+        <Button key="details" plain dimColor label="⋯" onPress={() => void $.ui.open({ id: PANE, title: TITLE })} />
       </Box>
     )
   })
@@ -737,6 +825,20 @@ const GLYPH_COLORS: Record<IconName, 'suggestion' | 'merged' | 'planMode' | 'cla
   shield: 'success',
   shieldOff: 'subtle',
 }
+
+/** The band's gauges in reading order, each with the pane's icon for it. */
+const BAND_GAUGES: Gauge[] = ['minutes', 'tokens', 'share', 'weeklyShare']
+const BAND_ICONS: Record<Gauge, IconName> = { minutes: 'clock', tokens: 'tokens', share: 'session', weeklyShare: 'weekly' }
+const GAUGE_NAMES: Record<Gauge, string> = { minutes: 'Time', tokens: 'Tokens', share: 'Session', weeklyShare: 'Weekly' }
+const BAR_CELLS = 10
+const BAR_PX = 64
+const BAR_HEIGHT = 4
+const ACCENT_HEX = '#4f8fe0'
+/** How much closer another limit must be before it takes the bar. */
+const LEAD_MARGIN = 0.05
+const TRACK = 'rgba(139, 145, 156, 0.25)'
+const WARNING_HEX = '#e0a32f'
+const ERROR_HEX = '#e0524f'
 
 /**
  * The usage gauge, shrunk to the top-left, with the window's length set in the
