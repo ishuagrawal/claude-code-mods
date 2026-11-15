@@ -1,0 +1,357 @@
+import { expect, test } from 'claude-code/testing'
+
+import {
+  DEFAULT_LIMITS as DEFAULTS,
+  MAIN,
+  loopShare,
+  meterOf,
+  newRun,
+  parseArgs,
+  pct,
+  usedOf,
+  withLimitChanged,
+  parseLimitInput,
+  limitLabel,
+  ratesOf,
+  shareOf,
+  shareText,
+  withCalibrated,
+  tripOf,
+  withAllowed,
+  withLoop,
+  withLoopDone,
+  withPaused,
+  withReading,
+  withStep,
+} from '../hooks/fence'
+
+const DEFAULT_LIMITS = { ...DEFAULTS, isOn: true, share: 10, weeklyShare: 2 }
+
+const usage = (input: number, output: number) => ({
+  input_tokens: input,
+  output_tokens: output,
+  cache_read_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+})
+
+test('a prompt measures the 5-hour window from where it started', async () => {
+  let run = newRun('t1', 0, [{ kind: 'five_hour', percentUsed: 40, resetsAt: '2026-11-15T15:40:00Z' }])
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 43.5, resetsAt: '2026-11-15T15:40:00Z' }])
+  expect(usedOf(run.five)).toBe(3.5)
+  expect(pct(usedOf(run.five))).toBe('3.5%')
+})
+
+test('a window that resets mid-prompt keeps what was spent before it', async () => {
+  let run = newRun('t1', 0, [{ kind: 'five_hour', percentUsed: 95, resetsAt: 'A' }])
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 98, resetsAt: 'A' }])
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 2, resetsAt: 'B' }])
+  expect(usedOf(run.five)).toBe(5)
+})
+
+test('the share splits between loops by the weight of their requests', async () => {
+  let run = newRun('t1', 0, [{ kind: 'five_hour', percentUsed: 10 }])
+  run = withLoop(run, { id: 'a1', label: 'Explore', toolUseId: 'tu1', units: 0, steps: 0, isRunning: true, isBackground: false })
+  run = withStep(run, MAIN, 'claude-opus-5-5', usage(1000, 100))
+  run = withStep(run, 'a1', 'claude-opus-5-5', usage(1000, 100))
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 14 }])
+  expect(loopShare(run, MAIN)).toBe(2)
+  expect(loopShare(run, 'a1')).toBe(2)
+})
+
+test('the fence trips at the per-prompt share, and an Allow gives half again', async () => {
+  let run = newRun('t1', 0, [{ kind: 'five_hour', percentUsed: 20 }])
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 30 }])
+  const trip = tripOf(run, DEFAULT_LIMITS, 0)
+  expect(trip?.kind).toBe('share')
+  run = withAllowed(withPaused(run, trip!, 'tu9', 0), DEFAULT_LIMITS, trip!, 1000)
+  expect(tripOf(run, DEFAULT_LIMITS, 1000)).toBe(null)
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 35 }])
+  expect(tripOf(run, DEFAULT_LIMITS, 1000)?.kind).toBe('share')
+})
+
+test('the working line names the closest limit, amber past 80%', async () => {
+  let run = newRun('t1', 0, [{ kind: 'five_hour', percentUsed: 50 }])
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 53.4 }])
+  expect(meterOf(run, DEFAULT_LIMITS, 0)?.text).toBe('3.4% session of 10% session')
+  expect(meterOf(run, DEFAULT_LIMITS, 0)?.isWarning).toBe(false)
+  run = withReading(run, [{ kind: 'five_hour', percentUsed: 58.6 }])
+  expect(meterOf(run, DEFAULT_LIMITS, 0)?.text).toBe('8.6% session of 10% session')
+})
+
+test('a run ends when every loop it started has ended', async () => {
+  let run = newRun('t1', 0, [{ kind: 'five_hour', percentUsed: 0 }])
+  run = withLoop(run, { id: 'a1', label: 'Build', toolUseId: null, units: 0, steps: 0, isRunning: true, isBackground: true })
+  run = withLoopDone(run, MAIN, 5)
+  expect(run.status).toBe('running')
+  run = withLoopDone(run, 'a1', 9)
+  expect(run.status).toBe('done')
+  expect(run.endedAt).toBe(9)
+})
+
+test('/fence arguments set the limits', async () => {
+  const parsed = parseArgs('15% 20m', DEFAULT_LIMITS)
+  expect('limits' in parsed && parsed.limits).toEqual({ isOn: true, share: 15, weeklyShare: 2, minutes: 20, tokens: 0 })
+  expect('error' in parseArgs('window 85', DEFAULT_LIMITS)).toBe(true)
+  expect('error' in parseArgs('bananas', DEFAULT_LIMITS)).toBe(true)
+})
+
+const PANE = {
+  plugin: 'budget-fence',
+  component: 'Pane',
+  requestId: 'budget-fence',
+  props: {
+    title: 'Budget fence',
+    isFocused: false,
+    bodyColumns: 72,
+    placement: 'dock',
+    scroll: { offset: 0, bodyRows: 30 },
+    view: {},
+  },
+} as const
+
+test('before any prompt the pane shows the limits to set', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value).toBe('0')
+    expect((await ui.find({ type: 'Select', key: 'limit-share' }))?.props.value).toBe('0')
+    expect(await ui.find({ type: 'Select', key: 'limit-window' })).toBe(undefined)
+    expect(await ui.find({ type: 'Text', text: 'ALSO PAUSE WHEN' })).toBe(undefined)
+    expect(await ui.find({ type: 'Text', text: 'Running' })).toBe(undefined)
+    await ui.unmount()
+  }
+})
+
+test('a plan with only a weekly window is measured against it, with its own share', async () => {
+  let run = newRun('t1', 0, [{ kind: 'seven_day', percentUsed: 85, resetsAt: '2026-11-16T16:00:00.000Z' }])
+  expect(run.five).toBe(null)
+  run = withReading(run, [{ kind: 'seven_day', percentUsed: 86.2 }])
+  const shareOnly = DEFAULT_LIMITS
+  expect(meterOf(run, shareOnly, 0)?.text).toBe('1.2% weekly of 2.0% weekly')
+  run = withReading(run, [{ kind: 'seven_day', percentUsed: 87.1 }])
+  expect(tripOf(run, shareOnly, 0)?.reason).toBe('This prompt has used 2.1% of your weekly limit')
+})
+
+test('the band shows the meter while a prompt runs', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: { isOn: true, share: 10 } }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] },
+  }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+
+  const ui = await $.ui.mount({
+    plugin: 'budget-fence',
+    component: 'AbovePrompt',
+    requestId: 'band',
+    surface: 'desktop',
+    props: { hasSurvey: false, isCollapsed: false, bodyColumns: 80, maxRows: 4 },
+  } as never)
+  expect((await ui.find({ type: 'Text', text: /session/ }))?.text).toBe('<1% session of 10% session')
+  await ui.unmount()
+})
+
+test('time and token limits trip on their own, and a changed limit drops earlier room', async () => {
+  const limits = { ...DEFAULT_LIMITS, minutes: 10, tokens: 100_000 }
+  let run = newRun('t1', 0, [])
+  run = withStep(run, MAIN, 'claude-opus-5-5', usage(90_000, 5_000))
+  expect(tripOf(run, limits, 60_000)).toBe(null)
+  run = withStep(run, MAIN, 'claude-opus-5-5', usage(4_000, 2_000))
+  const trip = tripOf(run, limits, 60_000)
+  expect(trip?.kind).toBe('tokens')
+  run = withAllowed(withPaused(run, trip!, 'tu1', 60_000), limits, trip!, 60_000)
+  expect(run.bonus.tokens).toBe(51_000)
+  expect(tripOf(run, limits, 60_000)).toBe(null)
+  expect(tripOf(run, limits, 11 * 60_000)?.kind).toBe('minutes')
+  expect(withLimitChanged(run, 'tokens').bonus.tokens).toBe(0)
+  expect(parseArgs('tokens 250k time 30m session off', DEFAULT_LIMITS)).toEqual({
+    limits: { ...DEFAULT_LIMITS, tokens: 250_000, minutes: 30, share: 0 },
+    said: 'Each prompt pauses at 30m of work, 250k tokens, 2.0% of the weekly limit.',
+  })
+})
+
+test('a weekly-only plan hides the session limit, and a pick changes the limit', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 200000 }, rateLimits: [{ kind: 'seven_day', percentUsed: 85 }] },
+  }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Select', key: 'limit-share' })).toBe(undefined)
+  expect((await ui.find({ type: 'Select', key: 'limit-weeklyShare' }))?.props.value).toBe('0')
+  await ui.select({ key: 'limit-minutes', value: '15' })
+  expect((await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value).toBe('15')
+  await ui.unmount()
+})
+
+test('the fence starts off, keeps its limits while off, and turns on with them', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  expect(DEFAULTS.isOn).toBe(false)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: 'Fence is off' }))?.text).toBe('Fence is off')
+  await ui.select({ key: 'limit-tokens', value: '500000' })
+  await ui.press({ key: 'toggle' })
+  expect((await ui.find({ type: 'Text', text: 'Fence is on' }))?.text).toBe('Fence is on')
+  await ui.press({ key: 'toggle' })
+  await ui.press({ key: 'toggle' })
+  expect((await ui.find({ type: 'Select', key: 'limit-tokens' }))?.props.value).toBe('500000')
+  await ui.unmount()
+  expect(parseArgs('off', { ...DEFAULTS, tokens: 500_000 })).toEqual({
+    limits: { ...DEFAULTS, tokens: 500_000 },
+    said: 'Budget fence is off. Your limits are kept for when you turn it on.',
+  })
+})
+
+test('a finished prompt shows its spend, the plan bars, icons, and lands in the history', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({
+    value: {
+      startedAt: 0,
+      context: { window: 200000 },
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 40 },
+        { kind: 'seven_day', percentUsed: 85 },
+      ],
+    },
+  }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: (e as { turnId: string }).turnId === 't2' ? 'Fixed the flaky login test.\nDetails follow.' : 'done' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'redesign the fence pane\nmore detail', turnId: 't1' })
+  await $.turn.complete({ turnId: 't1', text: 'done', isAborted: false, reason: 'answer', answer: 'done' } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: 'LAST PROMPT' }))?.text).toBe('LAST PROMPT')
+  expect(await ui.find({ type: 'Text', text: 'YOUR PLAN' })).toBe(undefined)
+  expect((await ui.find({ type: 'Svg' }))?.props.width).toBe(16)
+  expect((await ui.find({ type: 'Text', text: 'redesign the fence pane' }))?.text).toBe('redesign the fence pane')
+  await ui.unmount()
+
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await term.find({ type: 'Text', text: '#' }))?.text).toBe('#')
+  await term.unmount()
+
+  await $.turn.start({ text: '', turnId: 't2' })
+  await $.turn.complete({ turnId: 't2', text: 'Fixed the flaky login test.', isAborted: false, reason: 'answer', answer: 'done' } as never)
+  const hist = await $.ui.mount({ ...PANE, requestId: 'budget-fence-history', surface: 'desktop' })
+  expect((await hist.find({ type: 'Text', text: /^Claude:/ }))?.text).toBe('Claude: Fixed the flaky login test.')
+  expect((await hist.find({ type: 'Text', text: /^2 prompts/ }))?.text).toContain('0 tokens')
+  await hist.unmount()
+})
+
+test('each setting takes a custom value typed in its own field', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.select({ key: 'limit-tokens', value: 'custom' })
+  await ui.input({ key: 'custom-tokens', text: 'lots', kind: 'submit' })
+  expect((await ui.find({ type: 'Text', text: /^Didn't understand/ }))?.text).toContain('"lots"')
+  await ui.input({ key: 'custom-tokens', text: '750k', kind: 'submit' })
+  expect(await ui.find({ type: 'Input', key: 'custom-tokens' })).toBe(undefined)
+  const tokensSelect = await ui.find({ type: 'Select', key: 'limit-tokens' })
+  expect(tokensSelect?.props.value).toBe('750000')
+  await ui.select({ key: 'limit-minutes', value: 'custom' })
+  await ui.input({ key: 'custom-minutes', text: '1h 30m', kind: 'submit' })
+  expect((await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value).toBe('90')
+  await ui.unmount()
+
+  expect(parseLimitInput('minutes', '1.5h')).toBe(90)
+  expect(parseLimitInput('minutes', '45 min')).toBe(45)
+  expect(parseLimitInput('tokens', '1.5M')).toBe(1_500_000)
+  expect(parseLimitInput('share', '7.5%')).toBe(7.5)
+  expect(parseLimitInput('share', '150')).toBe(null)
+  expect(limitLabel('minutes', 90)).toBe('1h 30m')
+})
+
+const tok = (input: number) => ({ input_tokens: input, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
+
+/** A finished prompt one model did alone, moving the weekly window from one reading to another. */
+function solo(model: string, units: number, from: number, to: number) {
+  return withReading(withStep(newRun('p', 0, [{ kind: 'seven_day', percentUsed: from }]), MAIN, model, tok(units)), [{ kind: 'seven_day', percentUsed: to }])
+}
+
+test('each model learns its own rate, and a prompt on an untaught model stays rounded', async () => {
+  // Opus: 30 units moved the weekly window 3 points, so 0.1 point per unit.
+  let cal = withCalibrated({}, solo('claude-opus-5-5', 30, 10, 13))
+  // A dated id and a [1m] tag are the same model.
+  expect(Object.keys(cal)).toEqual(['claude-opus-5-5'])
+  expect(ratesOf(withCalibrated({}, solo('claude-opus-5-5-20261101[1m]', 30, 10, 13)))['claude-opus-5-5']?.week).toBe(0.1)
+  expect(ratesOf(cal)['claude-opus-5-5']?.week).toBe(0.1)
+
+  // An Opus prompt of 3 units that moved the reading 20 → 21 is about 0.3%, not 1%.
+  let run = newRun('t', 0, [{ kind: 'seven_day', percentUsed: 20 }], 'go', ratesOf(cal))
+  run = withReading(withStep(run, MAIN, 'claude-opus-5-5', tok(3)), [{ kind: 'seven_day', percentUsed: 21 }])
+  expect(shareText(shareOf(run, 'week'))).toBe('~0.30%'.replace('0.30', '0.3'))
+
+  // The same work on Haiku has no rate yet: the reading stands, marked approximate.
+  let haiku = newRun('h', 0, [{ kind: 'seven_day', percentUsed: 20 }], 'go', ratesOf(cal))
+  haiku = withReading(withStep(haiku, MAIN, 'claude-haiku-5-5', tok(3)), [{ kind: 'seven_day', percentUsed: 21 }])
+  expect(shareOf(haiku, 'week').isEstimate).toBe(false)
+  expect(shareText(shareOf(haiku, 'week'))).toBe('~1.0%')
+
+  // A prompt that mixed models evenly teaches neither.
+  let mixed = withStep(newRun('m', 0, [{ kind: 'seven_day', percentUsed: 30 }]), MAIN, 'claude-opus-5-5', tok(10))
+  mixed = withReading(withStep(mixed, 'a1', 'claude-haiku-5-5', tok(10)), [{ kind: 'seven_day', percentUsed: 35 }])
+  cal = withCalibrated(cal, mixed)
+  expect(Object.keys(cal)).toEqual(['claude-opus-5-5'])
+
+  // No "<" beside a sign: an unmoved rounded reading and a sliver both read as words or digits.
+  expect(shareText(shareOf(newRun('z', 0, [{ kind: 'seven_day', percentUsed: 20 }]), 'week'))).toBe('<1%')
+  expect(pct(0.04)).toBe('0.04%')
+})
+
+test('recent prompts start collapsed and open on a press', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) =>
+    (e as { key: string }).key === 'history'
+      ? { value: [{ id: 'h1', prompt: 'tidy the README', reply: '', startedAt: 0, activeMs: 60_000, tokens: 1200, sessionPct: null, weeklyPct: 0.3, sessionNowPct: null, weeklyNowPct: 85, agents: 0, pauses: 0, wasStopped: false }] }
+      : { value: undefined },
+  )
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 120_000 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: 'RECENT PROMPTS' }))?.text).toBe('RECENT PROMPTS')
+  expect((await ui.find({ type: 'Button', key: 'recent-toggle' }))?.text).toBe('Show')
+  expect((await ui.find({ type: 'Button', key: 'history' }))?.text).toBe('View all')
+  expect(await ui.find({ type: 'Text', text: 'tidy the README' })).toBe(undefined)
+  await ui.press({ key: 'recent-toggle' })
+  expect((await ui.find({ type: 'Text', text: 'tidy the README' }))?.text).toBe('tidy the README')
+  expect((await ui.find({ type: 'Text', text: /tokens/ }))?.text).toBe('1m · 1k tokens · ~0.3% of weekly')
+  await ui.unmount()
+})

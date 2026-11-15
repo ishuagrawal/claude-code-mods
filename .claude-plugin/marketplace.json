@@ -1,0 +1,11 @@
+{
+  "name": "claude-code-mods",
+  "owner": { "name": "ishuagrawal" },
+  "plugins": [
+    {
+      "name": "budget-fence",
+      "source": "./plugins/budget-fence",
+      "description": "Pause a prompt before it runs too long, uses too many tokens or eats too much of your usage limit, with limits you can change mid-prompt."
+    }
+  ]
+}
