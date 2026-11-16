@@ -25,6 +25,13 @@ import {
   withPaused,
   withReading,
   withStep,
+  withDenied,
+  historyEntryOf,
+  isAgentArgs,
+  newAgentRun,
+  parseAgentArgs,
+  unitsOf,
+  withOther,
 } from '../hooks/fence'
 
 const DEFAULT_LIMITS = { ...DEFAULTS, isOn: true, share: 10, weeklyShare: 2 }
@@ -88,6 +95,13 @@ test('a run ends when every loop it started has ended', async () => {
   run = withLoopDone(run, 'a1', 9)
   expect(run.status).toBe('done')
   expect(run.endedAt).toBe(9)
+})
+
+test('a run the fence stopped is still marked stopped once it finishes', () => {
+  let run = newAgentRun('bg1', 'Long test', null, 0, [])
+  run = withLoopDone(withDenied(run, 1000), 'bg1', 2000)
+  expect(run.status).toBe('done')
+  expect(historyEntryOf(run).wasStopped).toBe(true)
 })
 
 test('/fence arguments set the limits', async () => {
@@ -269,7 +283,10 @@ test('a finished prompt shows its spend, the plan bars, icons, and lands in the 
   expect((await ui.find({ type: 'Text', text: 'LAST PROMPT', in: 'live-head' }))?.text).toBe('LAST PROMPT')
   expect(await ui.find({ type: 'Text', text: 'YOUR PLAN' })).toBe(undefined)
   expect((await ui.find({ type: 'Svg' }))?.props.width).toBe(16)
-  expect((await ui.find({ type: 'Text', text: 'redesign the fence pane', in: 'live-head' }))?.text).toBe('redesign the fence pane')
+  // The prompt is the pane's own row, under the heading, led by the prompt icon as in the history.
+  expect((await ui.find({ type: 'Text', text: 'redesign the fence pane' }))?.text).toBe('redesign the fence pane')
+  expect(await ui.find({ type: 'Text', text: 'redesign the fence pane', in: 'live-head' })).toBe(undefined)
+  expect((await ui.findAll({ type: 'Svg' })).map(x => x.props.alt)).toContain('Prompt')
   // Each figure keeps its icon, drawn by the pane, over a column of the same width as its number's.
   const svgs = (await ui.findAll({ type: 'Svg' })).map(x => x.props.alt as string)
   expect(['Time', 'Tokens', 'Session', 'Weekly'].every(name => svgs.includes(name))).toBe(true)
@@ -476,6 +493,13 @@ test('a value typed under Other sets the limit; other words go to Claude', async
   expect(typed.asked[1]?.question).toBe('1 min is no more than it has used. This prompt has used 2m, past its time limit of 1 min. Keep working?')
   expect(typed.result.decision).toBe('allow')
   expect(typed.saved).toEqual([{ isOn: true, minutes: 10, tokens: 0, share: 0, weeklyShare: 0 }])
+})
+
+test('a question left with no choice stops the call without quoting the app’s placeholder', async ($, on) => {
+  const { result } = await trippedPrompt($, on, ['[No preference]'])
+  expect(result.decision).toBe('deny')
+  expect(result.reason).toContain('chose to stop here')
+  expect(result.reason).not.toContain('No preference')
 })
 
 test('words typed under Other stop the call and reach Claude', async ($, on) => {
@@ -782,4 +806,357 @@ test('desktop focus redraws wait when the dropdown focus event comes later', asy
   await focus('limit-share')
   await term.redraw({ ...PANE.props, isFocused: true })
   await term.unmount()
+})
+
+test('a background agent counts its own steps, and each run takes its own part of the windows', () => {
+  let main = newRun('t1', 0, [{ kind: 'five_hour', percentUsed: 10 }])
+  let agent = newAgentRun('bg1', 'Audit deps', null, 0, [{ kind: 'five_hour', percentUsed: 10 }])
+  main = withOther(withStep(main, MAIN, 'claude-opus-5-5', usage(1000, 100)), unitsOf('claude-opus-5-5', usage(3000, 300)))
+  agent = withStep(withOther(agent, unitsOf('claude-opus-5-5', usage(1000, 100))), 'bg1', 'claude-opus-5-5', usage(3000, 300))
+  main = withReading(main, [{ kind: 'five_hour', percentUsed: 18 }])
+  agent = withReading(agent, [{ kind: 'five_hour', percentUsed: 18 }])
+  // Eight points moved; the agent did three quarters of the work.
+  expect(shareOf(main, 'five').value).toBe(2)
+  expect(shareOf(agent, 'five').value).toBe(6)
+  expect(agent.tokens).toBe(3300)
+  expect(tripOf(agent, { ...DEFAULT_LIMITS, share: 5 }, 0)?.reason).toBe('This agent has used ~6.0% of your session limit')
+  // A reading shared with this much other work teaches no rate.
+  expect(withCalibrated({}, { ...agent, status: 'done' })).toEqual(withCalibrated({}, { ...agent, status: 'done', modelUnits: {} }))
+})
+
+test('/fence background sets the limits each background agent starts with', () => {
+  expect(isAgentArgs('agents 10m')).toBe(true)
+  expect(isAgentArgs('time 10m')).toBe(false)
+  expect(parseAgentArgs('background tokens 200k time 10m', DEFAULTS)).toEqual({
+    limits: { ...DEFAULTS, tokens: 200_000, minutes: 10 },
+    said: 'Each new background agent pauses at 10m of work, 200k tokens.',
+  })
+  expect('error' in parseAgentArgs('background off', DEFAULTS)).toBe(true)
+  expect(parseAgentArgs('bg session off', { ...DEFAULTS, share: 5 })).toEqual({ limits: DEFAULTS, said: 'Background agents have no limits.' })
+})
+
+test('a background agent is fenced on its own, asks by name, and raising it changes only its limit', async ($, on) => {
+  let t = 0
+  const asked: string[] = []
+  const saved: string[] = []
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => {
+    const key = (e as { key: string }).key
+    return { value: key === 'limits' ? { isOn: true, minutes: 30 } : key === 'agent-limits' ? { isOn: true, minutes: 1 } : undefined }
+  })
+  on('store.set', (_, e) => {
+    saved.push((e as { key: string }).key)
+    return { value: undefined }
+  })
+  on('clock.now', () => ({ value: t }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('session.surfaces', () => ({ value: ['desktop'] }) as never)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('agent.spawn', () => ({ model: 'haiku', agentId: 'bg1' }) as never)
+  on('turn.complete', () => ({ text: '' }))
+  on('tool.check', { tool: 'Bash' }, () => ({ decision: 'allow' }))
+  on('tool.call', { tool: 'AskUserQuestion' }, (_, e) => {
+    const q = (e as unknown as { questions: { question: string; options: { label: string }[] }[] }).questions[0]!
+    asked.push(q.question)
+    return { result: { questions: [q], answers: { [q.question]: 'Continue and raise the time limit to 3 min' } } } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  t = 30_000
+  await $.agent.spawn({ tool_use_id: 'tu1', prompt: 'audit', description: 'Audit deps', subagentType: 'general-purpose', background: true, fork: false } as never)
+  t = 150_000
+
+  // The prompt is well under its 30m; the agent, measured from its spawn, is past its own 1m.
+  expect((await $.tool.check({ tool: 'Bash', input: {}, tool_use_id: 'u0', approver: 'person' } as never)).decision).toBe('allow')
+  expect(asked).toEqual([])
+  const result = await $.tool.check({ tool: 'Bash', input: {}, tool_use_id: 'u1', agentId: 'bg1' } as never)
+  expect(asked).toEqual(['Background agent “Audit deps” has used 2m, past its time limit of 1 min. Keep working?'])
+  expect(result.decision).toBe('allow')
+  // Its own limit changed: not this session's, not the background defaults.
+  expect(saved.filter(k => k === 'limits' || k === 'agent-limits')).toEqual([])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: 'BACKGROUND AGENTS' }))?.text).toBe('BACKGROUND AGENTS')
+  // Collapsed by default, with how many are running beside its Show.
+  expect(await ui.find({ type: 'Text', text: 'Audit deps' })).toBe(undefined)
+  expect((await ui.find({ type: 'Text', text: '1 running' }))?.text).toBe('1 running')
+  await ui.press({ key: 'agents-toggle' })
+  expect((await ui.find({ type: 'Text', text: 'Audit deps' }))?.text).toBe('Audit deps')
+  expect((await ui.find({ type: 'Text', text: /\/ 3m$/, in: 'live-a-bg1' }))?.text).toBe('2m / 3m')
+  // The background agents sit under the prompt's own limits, each with its limits on one line.
+  const texts = (await ui.findAll({ type: 'Text' })).map(x => x.text)
+  expect(texts.indexOf('PAUSE EACH PROMPT AFTER')).toBeLessThan(texts.indexOf('BACKGROUND AGENTS'))
+  expect(texts).toContain('Default limits for new agents')
+  expect(texts).toContain('1 min')
+  // The defaults read as settings, not an agent: under a settings icon, with no border of their own.
+  expect((await ui.findAll({ type: 'Box' })).some(x => x.props.borderStyle !== undefined)).toBe(false)
+  expect((await ui.findAll({ type: 'Svg' })).map(x => x.props.alt)).toContain('Settings')
+  expect((await ui.find({ type: 'Button', key: 'agent-limits-bg1' }))?.props.label).toBe('Edit limits')
+  expect((await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value).toBe('30')
+  // The new-agent limits open as the section's last card.
+  expect(await ui.find({ type: 'Select', key: 'limit-bg-minutes' })).toBe(undefined)
+  await ui.press({ key: 'agent-limits-new-agents' })
+  expect((await ui.find({ type: 'Select', key: 'limit-bg-minutes' }))?.props.value).toBe('1')
+  await ui.press({ key: 'agent-limits-bg1' })
+  expect((await ui.find({ type: 'Select', key: 'limit-a-bg1-minutes' }))?.props.value).toBe('3')
+  await ui.select({ key: 'limit-a-bg1-minutes', value: '30' })
+  expect((await ui.find({ type: 'Select', key: 'limit-a-bg1-minutes' }))?.props.value).toBe('30')
+  // Opening one card closes the other.
+  expect(await ui.find({ type: 'Select', key: 'limit-bg-minutes' })).toBe(undefined)
+  await ui.press({ key: 'agent-limits-bg1' })
+  // An agent's row carries no label of where its limits came from.
+  const labels = (await ui.findAll({ type: 'Text' })).map(x => x.text)
+  expect(labels).not.toContain('Custom limits')
+  expect(labels).not.toContain('Default limits')
+  expect(await ui.find({ type: 'Button', key: 'agent-reset-bg1' })).toBe(undefined)
+  await ui.unmount()
+
+  // Once the prompt is done, the band follows the agent still going, by name.
+  await $.turn.complete({ turnId: 't1', reason: 'answer', answer: '', durationMs: 0, isAborted: false })
+  const band = await $.ui.mount({
+    plugin: 'budget-fence',
+    component: 'AbovePrompt',
+    requestId: 'band',
+    surface: 'terminal',
+    props: { hasSurvey: false, isCollapsed: false, bodyColumns: 100, maxRows: 4 },
+  } as never)
+  expect((await band.find({ type: 'Text', text: /\/ 30m$/ }))?.text).toBe('2m / 30m')
+  expect((await band.find({ type: 'Text', text: 'Audit deps' }))?.text).toBe('Audit deps')
+  await band.unmount()
+
+  // Finished, it stays in the pane until the next prompt, then lives on in the history alone,
+  // marked with the agent icon.
+  await $.turn.complete({ turnId: 't1', agentId: 'bg1', reason: 'answer', answer: '', durationMs: 0, isAgent: true } as never)
+  const afterDone = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await afterDone.find({ type: 'Text', text: 'Audit deps' }))?.text).toBe('Audit deps')
+  await afterDone.unmount()
+  await $.turn.start({ text: 'next', turnId: 't2' })
+  const nextTurn = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await nextTurn.find({ type: 'Button', key: 'agent-limits-bg1' })).toBe(undefined)
+  expect(await nextTurn.find({ type: 'Client', key: 'live-a-bg1' })).toBe(undefined)
+  await nextTurn.press({ key: 'recent-toggle' })
+  const svgs = (await nextTurn.findAll({ type: 'Svg' })).map(x => x.props.alt)
+  expect(svgs).toContain('Background agent')
+  // Prompts lead with an icon of their own, so every row lines up the same way.
+  expect(svgs).toContain('Prompt')
+  await nextTurn.unmount()
+  // A turn the agent's report starts is titled by the agent, not by the report's markup.
+  await $.turn.start({ text: '<agent-message from="bg1">\nDone.\n</agent-message>', turnId: 't3' })
+  await $.turn.complete({ turnId: 't3', reason: 'answer', answer: '', durationMs: 0, isAborted: false } as never)
+  const reported = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await reported.find({ type: 'Text', text: 'Report from “Audit deps”' }))?.text).toBe('Report from “Audit deps”')
+  await reported.unmount()
+})
+
+test('each session keeps its own limits: a reload does not take what another session saved', async ($, on) => {
+  let stored: unknown = { isOn: true, minutes: 10 }
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? stored : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('session.root', () => ({ value: '/Users/someone/shop' }) as never)
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'fix the login bug', toolUses: [] }] }) as never)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const minutes = async () => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const value = (await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value
+    const name = (await ui.find({ type: 'Text', text: /^This session/ }))?.text
+    await ui.unmount()
+    return [value, name]
+  }
+  expect(await minutes()).toEqual(['10', 'This session · shop · fix the login bug'])
+  // New agents start with no limits until some are set, whatever the prompts' limits are.
+  const fresh = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await fresh.press({ key: 'agents-toggle' })
+  expect((await fresh.find({ type: 'Text', text: 'No limits' }))?.text).toBe('No limits')
+  expect((await fresh.find({ type: 'Text', text: 'Each background agent pauses at its own limits.' }))?.text).toBeDefined()
+  await fresh.unmount()
+  // Another session saves its own; this one, reloaded, keeps its 10 minutes.
+  stored = { isOn: true, minutes: 60 }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect((await minutes())[0]).toBe('10')
+})
+
+test('Done closes an agent’s limits even while the desktop still reports focus on its dropdown', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('session.measure', () => ({ changed: [] }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('agent.spawn', () => ({ model: 'haiku', agentId: 'bg1' }) as never)
+  on('ui.focus', { plugin: '*' }, () => ({}) as never)
+  // A held drawing waits on the clock; hold it for good, so a stuck press shows as a stuck test.
+  on('clock.sleep', () => new Promise(() => undefined) as never)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.agent.spawn({ tool_use_id: 'tu1', prompt: 'audit', description: 'Audit deps', subagentType: 'general-purpose', background: true, fork: false } as never)
+  const focus = (element: string) =>
+    $.ui.focus({ requestId: 'budget-fence', key: element, component: 'Pane', plugin: 'budget-fence', element, origin: { kind: 'person' } } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, isFocused: true } })
+  await ui.press({ key: 'agents-toggle' })
+  await ui.press({ key: 'agent-limits-bg1' })
+  await focus('limit-a-bg1-tokens')
+  await ui.select({ key: 'limit-a-bg1-tokens', value: '100000' })
+  // The menu closes, but the dropdown keeps the focus, and the desktop says so again.
+  await focus('limit-a-bg1-tokens')
+  // Done is pressed: the button takes no focus event of its own.
+  await ui.press({ key: 'agent-limits-bg1' })
+  expect(await ui.find({ type: 'Select', key: 'limit-a-bg1-tokens' })).toBe(undefined)
+  expect((await ui.find({ type: 'Button', key: 'agent-limits-bg1' }))?.props.label).toBe('Edit limits')
+  await ui.unmount()
+})
+
+test('a pane drawn before the module has its values back is drawn again once it does, with no click', async ($, on) => {
+  const entry = {
+    id: 'h1', prompt: 'an earlier prompt', reply: '', startedAt: 0, activeMs: 1000, tokens: 10,
+    sessionPct: null, weeklyPct: null, sessionNowPct: null, weeklyNowPct: null, agents: 0, pauses: 0, wasStopped: false,
+  }
+  let history: unknown[] = []
+  let held: Promise<void> = Promise.resolve()
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', async (_, e) => {
+    if ((e as { key: string }).key !== 'history') return { value: undefined }
+    await held
+    return { value: history }
+  })
+  on('store.set', () => ({ value: undefined }))
+  on('store.delete', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'first prompt', toolUses: [] }] }) as never)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: 'RECENT PROMPTS' })).toBe(undefined)
+
+  // A reload: the session's limits and name are kept, so nothing the pane reads is written,
+  // and the history comes back after the pane was drawn.
+  let release!: () => void
+  held = new Promise<void>(resolve => { release = resolve })
+  history = [entry]
+  const started = $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  release()
+  await started
+  expect((await ui.find({ type: 'Text', text: 'RECENT PROMPTS' }))?.text).toBe('RECENT PROMPTS')
+  await ui.unmount()
+})
+
+test('two background agents started at once are both fenced and listed', async ($, on) => {
+  let next = 0
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'limits' ? { isOn: true } : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('agent.spawn', () => ({ model: 'haiku', agentId: `bg${++next}` }) as never)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const spawn = (description: string) =>
+    $.agent.spawn({ tool_use_id: description, prompt: 'p', description, subagentType: 'general-purpose', background: true, fork: false } as never)
+  await Promise.all([spawn('Long test A'), spawn('Long test B')])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: '2 running' }))?.text).toBe('2 running')
+  await ui.press({ key: 'agents-toggle' })
+  expect((await ui.find({ type: 'Text', text: 'Long test A' }))?.text).toBe('Long test A')
+  expect((await ui.find({ type: 'Text', text: 'Long test B' }))?.text).toBe('Long test B')
+  await ui.unmount()
+})
+
+test('with the prompt and agents going, the band gives each a row of its own, a few at most', async ($, on) => {
+  let next = 0
+  let t = 0
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => {
+    const key = (e as { key: string }).key
+    return { value: key === 'limits' ? { isOn: true, minutes: 10 } : key === 'agent-limits' ? { isOn: true, minutes: 1 } : undefined }
+  })
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: t }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('agent.spawn', () => ({ model: 'haiku', agentId: `bg${++next}` }) as never)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const spawn = (description: string) =>
+    $.agent.spawn({ tool_use_id: description, prompt: 'p', description, subagentType: 'general-purpose', background: true, fork: false } as never)
+  await Promise.all([spawn('Long test A'), spawn('Long test B')])
+  t = 30_000
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const band = async (maxRows: number) => {
+      const ui = await $.ui.mount({
+        plugin: 'budget-fence',
+        component: 'AbovePrompt',
+        requestId: 'band',
+        surface,
+        props: { hasSurvey: false, isCollapsed: false, bodyColumns: 100, maxRows },
+      } as never)
+      const rows = await Promise.all(['run-t1', 'run-bg1', 'run-bg2'].map(async key => (await ui.find({ type: 'Box', key })) !== undefined))
+      const texts = (await ui.findAll({ type: 'Text' })).map(x => x.text)
+      const more = (await ui.find({ type: 'Text', text: /more running/ }))?.text
+      const details = (await ui.findAll({ type: 'Button' })).filter(x => x.key === 'details').length
+      await ui.unmount()
+      return { rows, texts, more, details }
+    }
+    // Room for all: the prompt's row, then each agent's, each against its own limit, with one ⋯.
+    const all = await band(8)
+    expect(all.rows).toEqual([true, true, true])
+    expect(all.texts).toContain('30s / 10m')
+    expect(all.texts.filter(x => x === '30s / 1m').length).toBe(2)
+    expect(all.texts).toContain('Long test A')
+    expect(all.texts).toContain('Long test B')
+    expect(all.more).toBe(undefined)
+    expect(all.details).toBe(1)
+    // Little room: the prompt's row, and the rest counted on a row of their own.
+    const tight = await band(3)
+    expect(tight.rows).toEqual([true, false, false])
+    expect(tight.texts).toContain('30s / 10m')
+    expect(tight.more).toBe('2 more running · ⋯ shows all')
+  }
+})
+
+test('a background agent the person stopped reports back without being asked again, and does nothing more', async ($, on) => {
+  let t = 0
+  const asked: string[] = []
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', (_, e) => {
+    const key = (e as { key: string }).key
+    return { value: key === 'limits' ? { isOn: true } : key === 'agent-limits' ? { isOn: true, minutes: 1 } : undefined }
+  })
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: t }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('session.surfaces', () => ({ value: ['desktop'] }) as never)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('agent.spawn', () => ({ model: 'haiku', agentId: 'bg1' }) as never)
+  on('tool.check', { tool: 'Bash' }, () => ({ decision: 'allow' }))
+  on('tool.check', { tool: 'SubagentHandback' }, () => ({ decision: 'allow' }))
+  on('tool.call', { tool: 'AskUserQuestion' }, (_, e) => {
+    const q = (e as unknown as { questions: { question: string }[] }).questions[0]!
+    asked.push(q.question)
+    return { result: { questions: [q], answers: { [q.question]: 'Stop here' } } } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.agent.spawn({ tool_use_id: 'tu1', prompt: 'p', description: 'Long test', subagentType: 'general-purpose', background: true, fork: false } as never)
+  t = 70_000
+  const check = (tool: string, id: string) => $.tool.check({ tool, input: {}, tool_use_id: id, agentId: 'bg1' } as never)
+  expect((await check('Bash', 'u1')).decision).toBe('deny')
+  expect(asked.length).toBe(1)
+  // Its report goes back with no second question; more work is refused, still without one.
+  expect((await check('SubagentHandback', 'u2')).decision).toBe('allow')
+  const more = await check('Bash', 'u3')
+  expect(more.decision).toBe('deny')
+  expect(more.reason).toContain('stopped this here')
+  expect(asked.length).toBe(1)
 })

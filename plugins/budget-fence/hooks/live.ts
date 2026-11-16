@@ -5,7 +5,14 @@ import type { ClientElements, ClientModule, RenderElement } from 'claude-code'
  * none) and the number's color. How full its limit is shows as a ring the pane
  * draws around the figure's icon.
  */
-export type PromptStat = { name: string; used: string; limit: string; color: string | null }
+export type PromptStat = {
+  name: string
+  used: string
+  limit: string
+  color: string | null
+  /** What the number counts, said after it on an agent's line ('tokens', 'session'); '' for time. */
+  unit?: string
+}
 
 /**
  * One live block of the pane's prompt section, as the hooks module works it out.
@@ -15,12 +22,14 @@ export type PromptStat = { name: string; used: string; limit: string; color: str
  */
 export type PromptView = {
   /**
-   * `head`: the heading, status, prompt, pause note and subagents. `figure`: one
+   * `head`: the heading and status. `notes`: the pause note and subagents, under the
+   * prompt the pane draws with its icon between them. `figure`: one
    * figure's number, under the icon and name the pane draws for it and beside its
-   * ring (images a block cannot draw).
+   * ring (images a block cannot draw). `line`: a background agent's status and
+   * figures on one line, under the name the pane draws for it.
    */
   part: PromptPart
-  /** The figure a `figure` block shows; '' for the head. */
+  /** The figure a `figure` block shows, the agent a `line` shows; '' for the head. */
   figure: string
   load: string
   at: number
@@ -33,13 +42,13 @@ export type PromptView = {
   loops: string
 }
 
-export type PromptPart = 'head' | 'figure'
+export type PromptPart = 'head' | 'notes' | 'figure' | 'line'
 
 /** What is drawn, without the timestamp used to order replies. */
 export function promptContent(view: PromptView): string {
   return JSON.stringify([
     view.part, view.figure, view.load, view.heading, view.status, view.statusColor, view.prompt, view.note, view.loops,
-    view.stats.map(s => [s.name, s.used, s.limit, s.color]),
+    view.stats.map(s => [s.name, s.used, s.limit, s.color, s.unit ?? '']),
   ])
 }
 
@@ -49,12 +58,12 @@ const TICK_MS = 1000
 /** One block, drawn here and, on surfaces without `Client`, by the hooks module. */
 export function drawPrompt({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, view: PromptView): RenderElement {
   const color = (c: string | null) => (c ? { color: c as never } : {})
-  if (view.part === 'head') {
+  if (view.part === 'head' || view.part === 'notes') {
     return Box({
       flexDirection: 'column',
       rowGap: 'sm',
       children: [
-        Box({
+        !view.heading ? null : Box({
           key: 'heading',
           flexDirection: 'row',
           alignItems: 'center',
@@ -68,6 +77,38 @@ export function drawPrompt({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, 
         view.prompt ? Text({ wrap: 'truncate-end', color: 'subtle', children: view.prompt }) : null,
         view.note ? Text({ size: 'footnote', color: 'error', children: view.note }) : null,
         view.loops ? Text({ size: 'footnote', color: 'subtle', wrap: 'truncate-end', children: view.loops }) : null,
+      ],
+    })
+  }
+  if (view.part === 'line') {
+    // A background agent: its status, then each figure against its own limit, wrapping as it must.
+    const stat = (s: PromptStat) =>
+      Text({
+        key: s.name,
+        size: 'footnote',
+        tabular: true,
+        children: [
+          Text({ ...color(s.color), children: s.used }),
+          s.limit ? Text({ color: 'subtle', children: ` / ${s.limit}` }) : null,
+          s.unit ? Text({ color: 'subtle', children: ` ${s.unit}` }) : null,
+        ],
+      })
+    return Box({
+      flexDirection: 'column',
+      rowGap: 'xs',
+      children: [
+        Box({
+          key: 'figures',
+          flexDirection: 'row',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          columnGap: 'md',
+          children: [
+            Text({ key: 'status', size: 'footnote', weight: 'medium', ...color(view.statusColor), children: view.status }),
+            ...view.stats.map(stat),
+          ],
+        }),
+        view.note ? Text({ key: 'note', size: 'footnote', color: 'error', children: view.note }) : null,
       ],
     })
   }

@@ -1,4 +1,4 @@
-/** What the person sets in the pane or with /fence. 0 turns a limit off. */
+/** What the person sets in the pane or with /fence, per session. 0 turns a limit off. */
 export type FenceLimits = {
   isOn: boolean
   /** Pause after this many minutes of work on one prompt. */
@@ -76,6 +76,24 @@ export type FenceRun = {
   pauses: number
   /** The person chose to go on with no limits: nothing trips for the rest of this prompt. */
   isUnfenced?: boolean
+  /** The fence stopped one of its calls; kept once the run finishes and its status is `done`. */
+  wasStopped?: boolean
+  /** A background agent's own run, rather than a prompt's. */
+  kind?: 'prompt' | 'agent'
+  /**
+   * Token weight spent by other work (a prompt, other background agents) while this run
+   * went on: the usage windows move for all of it, so this run's share is its own part.
+   */
+  otherUnits?: number
+}
+
+/** A background agent, fenced on its own: its run and the limits it pauses at. */
+export type FenceAgent = {
+  run: FenceRun
+  /** Its own limits; `isOn` is unused, the session's switch decides. */
+  limits: FenceLimits
+  /** Set in its own row, so a change to the background defaults leaves it alone. */
+  isCustom: boolean
 }
 
 /** A finished prompt as the history keeps it. */
@@ -99,6 +117,8 @@ export type FenceHistoryEntry = {
   agents: number
   pauses: number
   wasStopped: boolean
+  /** A background agent's run rather than a prompt's (absent on prompts). */
+  isAgent?: boolean
 }
 
 declare module 'claude-code' {
@@ -110,9 +130,19 @@ declare module 'claude-code' {
       history: Shaped<FenceHistoryEntry[]>
       /** Whether Recent prompts is expanded; collapsed by default. */
       recentOpen: Shaped<boolean>
+      /** Whether Background agents is expanded; collapsed by default. */
+      agentsOpen: Shaped<boolean>
       /** The setting whose custom value is being typed, and why the last try was refused. */
       editing: Shaped<{ key: string; error: string | null } | null>
       plan: Shaped<{ hasSession: boolean; hasWeekly: boolean } | null>
+      /** This session's background agents, each fenced on its own: running ones and the last few finished. */
+      agents: Shaped<FenceAgent[]>
+      /** The limits a new background agent of this session starts with. */
+      agentLimits: Shaped<FenceLimits>
+      /** The background agent whose limits are open in the pane. */
+      agentOpen: Shaped<string | null>
+      /** What this session is called in the pane: its folder and first prompt. */
+      sessionName: Shaped<{ folder: string; prompt: string } | null>
     }
   }
 }

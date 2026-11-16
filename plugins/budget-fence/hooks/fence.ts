@@ -1,6 +1,6 @@
 // The fence's arithmetic, kept free of `$` so tests can call it directly.
 
-import type { FenceBonus, FenceCalibration, FenceHistoryEntry, FenceRates, FenceTally, FenceLimits, FenceLoop, FenceMeasure, FenceRun } from '../types'
+import type { FenceAgent, FenceBonus, FenceCalibration, FenceHistoryEntry, FenceRates, FenceTally, FenceLimits, FenceLoop, FenceMeasure, FenceRun } from '../types'
 
 export const MAIN = 'main'
 
@@ -93,6 +93,33 @@ export function newRun(id: string, now: number, readings: readonly Reading[], pr
   )
 }
 
+/** A background agent's own run: measured from its spawn, alone in its loop until it starts helpers. */
+export function newAgentRun(
+  agentId: string,
+  label: string,
+  toolUseId: string | null,
+  now: number,
+  readings: readonly Reading[],
+  rates: FenceRates = {},
+): FenceRun {
+  return {
+    ...newRun(agentId, now, readings, label, rates),
+    kind: 'agent',
+    loops: [{ id: agentId, label, toolUseId, units: 0, steps: 0, isRunning: true, isBackground: true }],
+  }
+}
+
+/** Work outside this run that moved the usage windows while it went on. */
+export function withOther(run: FenceRun, units: number): FenceRun {
+  return units > 0 ? { ...run, otherUnits: (run.otherUnits ?? 0) + units } : run
+}
+
+/** Whose run a loop's work counts toward: the background agent that owns it, else the prompt. */
+export function ownerOf(agents: readonly FenceAgent[], loopId: string): string {
+  if (loopId === MAIN) return MAIN
+  return agents.find(a => a.run.loops.some(l => l.id === loopId))?.run.id ?? MAIN
+}
+
 function mainLoop(): FenceLoop {
   return { id: MAIN, label: 'Main session', toolUseId: null, units: 0, steps: 0, isRunning: true, isBackground: false }
 }
@@ -120,9 +147,10 @@ export function historyEntryOf(run: FenceRun, reply = ''): FenceHistoryEntry {
     weeklyIsExact: shareOf(run, 'week').isExact,
     sessionNowPct: run.five?.nowPct ?? null,
     weeklyNowPct: run.week?.nowPct ?? null,
-    agents: run.loops.filter(l => l.id !== MAIN).length,
+    agents: run.loops.filter(l => l.id !== MAIN && l.id !== run.id).length,
     pauses: run.pauses,
-    wasStopped: run.status === 'denied' || run.pausedToolUseId !== null,
+    wasStopped: run.wasStopped === true || run.status === 'denied' || run.pausedToolUseId !== null,
+    ...(run.kind === 'agent' ? { isAgent: true } : {}),
   }
 }
 
@@ -176,6 +204,18 @@ function grainOf(m: FenceMeasure): number {
 export type Share = { value: number; isExact: boolean; isEstimate: boolean }
 
 /**
+ * The part of the windows' movement this run's own work made. Other work running alongside
+ * (a prompt beside a background agent, or two agents) moves the same windows, so a run's
+ * reading is split by token weight; alone, it is all its own.
+ */
+export function ownFraction(run: FenceRun): number {
+  const other = run.otherUnits ?? 0
+  if (other <= 0) return 1
+  const own = totalUnits(run)
+  return own <= 0 ? 0 : own / (own + other)
+}
+
+/**
  * This prompt's share of a window, as finely as can be known.
  *
  * The plan reports whole points, so the measured difference between two readings
@@ -187,9 +227,10 @@ export type Share = { value: number; isExact: boolean; isEstimate: boolean }
 export function shareOf(run: FenceRun, which: 'five' | 'week'): Share {
   const m = run[which]
   if (!m) return { value: 0, isExact: true, isEstimate: false }
-  const measured = usedOf(m)
+  const fraction = ownFraction(run)
+  const measured = usedOf(m) * fraction
   const grain = grainOf(m)
-  if (grain < 1) return { value: measured, isExact: true, isEstimate: false }
+  if (grain < 1) return { value: measured, isExact: fraction === 1, isEstimate: false }
   const used = Object.entries(run.modelUnits ?? {}).filter(([, units]) => units > 0)
   const rated = used.map(([model, units]) => {
     const rate = run.rates?.[model]?.[which] ?? null
@@ -206,6 +247,8 @@ export function withCalibrated(cal: FenceCalibration, run: FenceRun): FenceCalib
   const total = entries.reduce((sum, [, u]) => sum + u, 0)
   const top = entries.reduce<[string, number] | null>((a, b) => (a === null || b[1] > a[1] ? b : a), null)
   if (!top || total === 0 || top[1] / total < SOLE_MODEL) return cal
+  // A reading shared with much other work teaches nothing about this run's own cost.
+  if ((run.otherUnits ?? 0) > 0.1 * totalUnits(run)) return cal
   const [model, units] = top
   const fold = (prev: { units: number; pct: number }, m: FenceMeasure | null) => {
     if (!m) return prev
@@ -304,7 +347,9 @@ export function tripOf(run: FenceRun, limits: FenceLimits, now: number): Trip | 
   if (!limits.isOn || run.status === 'done') return null
   for (const gauge of GAUGES) {
     const g = gaugeOf(run, limits, gauge, now)
-    if (g && g.cap > 0 && g.used >= g.cap) return { kind: gauge, reason: `This prompt has used ${formatUsed(gauge, g.used, g.share)}` }
+    if (g && g.cap > 0 && g.used >= g.cap) {
+      return { kind: gauge, reason: `${run.kind === 'agent' ? 'This agent' : 'This prompt'} has used ${formatUsed(gauge, g.used, g.share)}` }
+    }
   }
   return null
 }
@@ -362,7 +407,7 @@ export function withPaused(run: FenceRun, trip: Trip, toolUseId: string | null, 
 }
 
 export function withDenied(run: FenceRun, now: number): FenceRun {
-  return { ...run, ...endPause(run, now), status: 'denied', pausedToolUseId: null }
+  return { ...run, ...endPause(run, now), status: 'denied', pausedToolUseId: null, wasStopped: true }
 }
 
 function endPause(run: FenceRun, now: number): Pick<FenceRun, 'pausedMs' | 'pauseStartedAt'> {
@@ -459,6 +504,42 @@ function tokenCount(word: string): number | null {
   return Math.round(parseFloat(m[1]!) * (m[2] === 'k' ? 1000 : m[2] === 'm' ? 1_000_000 : 1))
 }
 
+/** Words that make `/fence` set the background agents' limits instead of the prompts'. */
+const AGENT_WORDS = ['background', 'agents', 'bg']
+
+/** Whether `/fence` arguments are about background agents. */
+export function isAgentArgs(args: string): boolean {
+  return AGENT_WORDS.includes(args.trim().toLowerCase().split(/\s+/)[0] ?? '')
+}
+
+/** Parses `/fence background …`: the same limits, for each background agent; no on or off of its own. */
+export function parseAgentArgs(args: string, limits: FenceLimits, hasSession = true): { limits: FenceLimits; said: string } | { error: string } {
+  const rest = args.trim().split(/\s+/).slice(1).join(' ')
+  if (/\b(on|off)\b/.test(rest.replace(/\b(session|weekly|tokens|time)\s+off\b/g, ''))) {
+    return { error: 'Background agents follow the fence\'s on and off. Try: /fence background time 10m tokens 200k' }
+  }
+  if (rest === '') return { limits, said: describeAgents(limits, hasSession) }
+  const parsed = parseArgs(rest, { ...limits, isOn: true }, hasSession)
+  if ('error' in parsed) return { error: parsed.error.replace(/\/fence /g, '/fence background ') }
+  const next = { ...parsed.limits, isOn: limits.isOn }
+  return { limits: next, said: describeAgents(next, hasSession) }
+}
+
+/** What the fence does to each background agent, in a sentence. */
+export function describeAgents(limits: FenceLimits, hasSession = true): string {
+  const parts = limitParts(limits, hasSession)
+  return parts.length > 0 ? `Each new background agent pauses at ${parts.join(', ')}.` : 'Background agents have no limits.'
+}
+
+function limitParts(limits: FenceLimits, hasSession: boolean): string[] {
+  return [
+    limits.minutes > 0 ? `${duration(limits.minutes * 60_000)} of work` : null,
+    limits.tokens > 0 ? `${tokens(limits.tokens)} tokens` : null,
+    hasSession && limits.share > 0 ? `${pct(limits.share)} of the session limit` : null,
+    limits.weeklyShare > 0 ? `${pct(limits.weeklyShare)} of the weekly limit` : null,
+  ].filter((x): x is string => x !== null)
+}
+
 /** Parses `/fence` arguments; answers the new limits or a message. */
 export function parseArgs(args: string, limits: FenceLimits, hasSession = true): { limits: FenceLimits; said: string } | { error: string } {
   const words = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
@@ -495,12 +576,7 @@ export function parseArgs(args: string, limits: FenceLimits, hasSession = true):
 /** What the fence will do, in a sentence. `hasSession` is false when the plan has no 5-hour window to measure. */
 export function describe(limits: FenceLimits, hasSession = true): string {
   if (!limits.isOn) return 'Budget fence is off. Your limits are kept for when you turn it on.'
-  const parts = [
-    limits.minutes > 0 ? `${duration(limits.minutes * 60_000)} of work` : null,
-    limits.tokens > 0 ? `${tokens(limits.tokens)} tokens` : null,
-    hasSession && limits.share > 0 ? `${pct(limits.share)} of the session limit` : null,
-    limits.weeklyShare > 0 ? `${pct(limits.weeklyShare)} of the weekly limit` : null,
-  ].filter(Boolean)
+  const parts = limitParts(limits, hasSession)
   const said = parts.length > 0 ? `Each prompt pauses at ${parts.join(', ')}.` : 'Budget fence is on, but no limit is set that applies to your plan.'
   return !hasSession && limits.share > 0
     ? `${said} Your plan has no session limit, so the ${pct(limits.share)} session limit does nothing; /fence session off clears it.`
