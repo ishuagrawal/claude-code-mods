@@ -4,9 +4,9 @@ Mods for [Claude Code](https://claude.com/claude-code). Each one is a plugin you
 
 ## Mods
 
-| Mod | What it does |
-| --- | --- |
-| [Budget fence](plugins/budget-fence)<br><a href="plugins/budget-fence"><img src="plugins/budget-fence/banner.png" alt="Budget fence" width="280"></a> | Pauses a prompt or background agent before it runs too long, uses too many tokens, or uses too much of your usage limit. |
+| Mod | What it does | Preview |
+| --- | --- | --- |
+| [Budget fence](plugins/budget-fence) | Pauses a prompt or background agent before it runs too long, uses too many tokens, or uses too much of your usage limit. | <a href="plugins/budget-fence"><img src="plugins/budget-fence/banner.png" alt="Budget fence" width="400"></a> |
 
 ## Install
 
