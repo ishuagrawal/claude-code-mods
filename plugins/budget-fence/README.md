@@ -1,3 +1,5 @@
+![Budget fence: a prompt paused at its session share, with its question and the limits pane](banner.png)
+
 # Budget fence
 
 Pauses work before it costs more than you meant to spend. It only watches and asks: Claude is never told about the budget, so it never cuts corners to fit.
