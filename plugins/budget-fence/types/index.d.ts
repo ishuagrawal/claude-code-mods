@@ -141,8 +141,6 @@ declare module 'claude-code' {
       agentLimits: Shaped<FenceLimits>
       /** The background agent whose limits are open in the pane. */
       agentOpen: Shaped<string | null>
-      /** What this session is called in the pane: its folder and first prompt. */
-      sessionName: Shaped<{ folder: string; prompt: string } | null>
     }
   }
 }

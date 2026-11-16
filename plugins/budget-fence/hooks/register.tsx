@@ -39,7 +39,6 @@ import {
   withHistory,
   limitLabel,
   parseLimitInput,
-  promptLine,
   describeAgents,
   isAgentArgs,
   newAgentRun,
@@ -62,7 +61,6 @@ const runAtom = atom({ plugin: 'budget-fence', key: 'run' } as const, null, { sh
 const agentsAtom = atom({ plugin: 'budget-fence', key: 'agents' } as const, [], { shape: 'agents-1' })
 const agentLimitsAtom = atom({ plugin: 'budget-fence', key: 'agentLimits' } as const, DEFAULT_LIMITS, { shape: 'agent-limits-1' })
 const agentOpenAtom = atom({ plugin: 'budget-fence', key: 'agentOpen' } as const, null, { shape: 'agent-open-1' })
-const sessionNameAtom = atom({ plugin: 'budget-fence', key: 'sessionName' } as const, null, { shape: 'session-name-1' })
 /** What a new session's background agents start with: the last set in any session. */
 const AGENT_STORE_KEY = 'agent-limits'
 /** Finished background agents kept in the pane until the next prompt, newest first, beside the running ones. */
@@ -167,23 +165,6 @@ function drawPaneInTurn<T>($: EngineInterface, e: RenderInput<'Pane'>, draw: () 
   })
   pane.drawing = drawn.catch(() => undefined)
   return drawn
-}
-
-/**
- * What the pane calls this session: its folder, and its first prompt once there is one
- * (read back from the transcript on a resume).
- */
-async function sessionNameOf($: EngineInterface): Promise<{ folder: string; prompt: string }> {
-  const root = await $.session.root().catch(() => '')
-  const folder = root.split('/').filter(Boolean).pop() ?? ''
-  const messages = await $.session.messages().catch(() => [])
-  const first = Array.isArray(messages) ? messages.find(m => m.role === 'user' && m.text.trim() && !m.text.trim().startsWith('<')) : undefined
-  return { folder, prompt: first ? promptLine(first.text) : '' }
-}
-
-/** The session's name on one line. */
-function nameText(name: { folder: string; prompt: string } | null): string {
-  return [name?.folder, name?.prompt].filter(Boolean).join(' · ')
 }
 
 /** Saved limits, checked key by key and filled out with the defaults. */
@@ -500,10 +481,6 @@ export const register: Register = on => {
       const agentSaved = savedLimits(await $.store.get(AGENT_STORE_KEY)) ?? DEFAULT_LIMITS
       await update($, agentLimitsAtom, () => agentSaved)
     }
-    if (!(await read($, sessionNameAtom))?.prompt) {
-      const name = await sessionNameOf($)
-      await update($, sessionNameAtom, () => name)
-    }
     await notePlan($, (await $.session.usage()).rateLimits)
     // A pane already open (as after /reload-plugins) may have been drawn by this module before the
     // values above were back, with no prompt, agents or history: draw it again now that they are,
@@ -550,10 +527,6 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     const submitted = await next(e)
     if (!e.isMeta) lastPrompt = e.command ? `/${e.command.name}${e.command.args ? ` ${e.command.args}` : ''}` : (submitted.text ?? e.text)
-    // A session with no name yet takes its first real prompt's.
-    if (!e.isMeta && !e.command && lastPrompt.trim() && !(await read($, sessionNameAtom))?.prompt) {
-      await update($, sessionNameAtom, name => ({ folder: name?.folder ?? '', prompt: promptLine(lastPrompt) }))
-    }
     return submitted
   }).catch(($, e, next) => next(e))
 
@@ -966,7 +939,7 @@ export const register: Register = on => {
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? (table as Elements['desktop']).Svg : undefined
     if (!Client) pane.hasPlainSurface = true
     const { run, history, agents } = pane
-    const [limits, plan, editing, isRecentOpen, isAgentsOpen, agentLimits, agentOpen, sessionName] = await Promise.all([
+    const [limits, plan, editing, isRecentOpen, isAgentsOpen, agentLimits, agentOpen] = await Promise.all([
       read($, limitsAtom),
       read($, planAtom),
       read($, editingAtom),
@@ -974,7 +947,6 @@ export const register: Register = on => {
       read($, agentsOpenAtom),
       read($, agentLimitsAtom),
       read($, agentOpenAtom),
-      read($, sessionNameAtom),
     ])
     const now = await $.clock.now()
     const icon = iconFor($, e)
@@ -1248,18 +1220,14 @@ export const register: Register = on => {
     )
 
     const recent = history.slice(0, 3)
-    const name = nameText(sessionName)
 
     return (
       <Box flexDirection="column" rowGap="lg">
         <Box flexDirection="row" alignItems="center" columnGap="sm">
           {icon(limits.isOn ? 'shield' : 'shieldOff', limits.isOn ? 'On' : 'Off')}
-          <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-            <Text weight="medium" color={limits.isOn ? 'success' : 'subtle'}>
+          <Box flexGrow={1} flexShrink={1} width={0} minWidth={0}>
+            <Text weight="medium" color={limits.isOn ? 'success' : 'subtle'} wrap="truncate-end">
               {limits.isOn ? 'Fence is on' : 'Fence is off'}
-            </Text>
-            <Text size="footnote" color="subtle" wrap="truncate-end">
-              {`This session${name ? ` · ${name}` : ''}`}
             </Text>
           </Box>
           <Button

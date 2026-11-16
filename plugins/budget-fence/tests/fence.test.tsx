@@ -957,17 +957,15 @@ test('each session keeps its own limits: a reload does not take what another ses
   on('store.set', () => ({ value: undefined }))
   on('clock.now', () => ({ value: 0 }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
-  on('session.root', () => ({ value: '/Users/someone/shop' }) as never)
-  on('session.messages', () => ({ value: [{ role: 'user', text: 'fix the login bug', toolUses: [] }] }) as never)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const minutes = async () => {
     const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
     const value = (await ui.find({ type: 'Select', key: 'limit-minutes' }))?.props.value
-    const name = (await ui.find({ type: 'Text', text: /^This session/ }))?.text
+    expect(await ui.find({ type: 'Text', text: /^This session/ })).toBe(undefined)
     await ui.unmount()
-    return [value, name]
+    return value
   }
-  expect(await minutes()).toEqual(['10', 'This session · shop · fix the login bug'])
+  expect(await minutes()).toBe('10')
   // New agents start with no limits until some are set, whatever the prompts' limits are.
   const fresh = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await fresh.press({ key: 'agents-toggle' })
@@ -977,7 +975,7 @@ test('each session keeps its own limits: a reload does not take what another ses
   // Another session saves its own; this one, reloaded, keeps its 10 minutes.
   stored = { isOn: true, minutes: 60 }
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  expect((await minutes())[0]).toBe('10')
+  expect(await minutes()).toBe('10')
 })
 
 test('Done closes an agent’s limits even while the desktop still reports focus on its dropdown', async ($, on) => {
