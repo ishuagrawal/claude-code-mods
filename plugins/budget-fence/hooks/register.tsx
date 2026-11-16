@@ -1539,7 +1539,8 @@ function levelOf(used: number, cap: number): Level {
 const CUSTOM = 'custom'
 
 const MINUTES = [0, 1, 5, 30, 60, 120, 300]
-const TOKENS = [0, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000]
+// Claude models take at most 1M tokens, so the presets stop there.
+const TOKENS = [0, 100_000, 250_000, 500_000, 750_000, 1_000_000]
 const SESSION = [0, 2, 5, 10, 15, 20, 30]
 const WEEKLY = [0, 1, 2, 5, 10, 25, 50]
 
