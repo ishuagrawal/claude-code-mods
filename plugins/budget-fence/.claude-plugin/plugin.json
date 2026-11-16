@@ -1,6 +1,11 @@
 {
   "name": "budget-fence",
   "version": "0.1.0",
-  "description": "Pause a prompt before it runs too long, uses too many tokens or eats too much of your usage limit, with limits you can change mid-prompt.",
-  "types": "./types/index.d.ts"
+  "description": "Pause a prompt or background agent before it runs too long, uses too many tokens, or uses too much of your usage limit.",
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "author": {
+    "name": "ishuagrawal",
+    "url": "https://github.com/ishuagrawal"
+  }
 }

@@ -1160,3 +1160,20 @@ test('a background agent the person stopped reports back without being asked aga
   expect(more.reason).toContain('stopped this here')
   expect(asked.length).toBe(1)
 })
+
+test('every /fence opens the pane, with or without settings after it', async ($, on) => {
+  const opened: string[] = []
+  on('command.register', () => ({ value: { command: 'fence' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
+  on('ui.open', (_, e) => {
+    opened.push((e as { id: string }).id)
+    return { value: { isPlaced: true } } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  for (const args of ['', 'on', 'tokens 500k', 'background time 10m', 'bananas']) await $.command.run({ command: 'fence', args } as never)
+  expect(opened).toEqual(['budget-fence', 'budget-fence', 'budget-fence', 'budget-fence', 'budget-fence'])
+})

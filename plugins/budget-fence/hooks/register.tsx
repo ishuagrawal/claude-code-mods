@@ -516,9 +516,10 @@ export const register: Register = on => {
   on('command.run', { command: 'fence' }, async ($, e) => {
     const [limits, plan] = await Promise.all([read($, limitsAtom), read($, planAtom)])
     const hasSession = plan?.hasSession ?? true
+    // Every /fence opens the pane, with or without settings typed after it, so the limits it
+    // sets are in view.
+    void $.ui.open({ id: PANE, title: TITLE })
     if (e.args.trim() === '') {
-      void $.ui.open({ id: PANE, title: TITLE })
-
       const agentLimits = await read($, agentLimitsAtom)
       const agents = limits.isOn ? ` ${describeAgents(agentLimits, hasSession)}` : ''
       return { text: `${describe(limits, hasSession)}${agents} Adjust the limits in the Budget fence pane.` }
